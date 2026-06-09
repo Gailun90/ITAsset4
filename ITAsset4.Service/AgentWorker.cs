@@ -1,0 +1,498 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ServiceProcess;
+using System.Threading;
+using System.Threading.Tasks;
+using ITAsset4.Common;
+using Newtonsoft.Json.Linq;
+
+namespace ITAsset4.Service
+{
+    /// <summary>
+    /// Windows Service 主体（.NET Framework 4.8 ServiceBase）
+    ///   - OnStart 线程启动增加 try/catch，防止 Thread.Start 崩溃导致 SCM 异常
+    ///   - WS fire-and-forget ConnectAsync 增加 ContinueWith 异常处
+    ///   - OnStop/OnShutdown 用 RequestAdditionalTime 向 SCM 申报超时，避免"停止失败"
+    ///   - 停止等待从 8s 延长为 15s，与 RemoteScreen/TcpScreenClient 最长超时对齐
+    ///   - 主循环 Task.Delay 缩短为 30s 并监听 SessionManager 触发信号，解决 Tray 启动延迟最长 1 分钟问题
+    ///   - SessionManager 新增 OnTrayNeeded 事件，用户登录时立即通知主循环
+    /// </summary>
+    public class AgentService : ServiceBase
+    {
+        private static readonly Random _rand = new Random();
+        private static readonly object _randLock = new object();
+
+        private CancellationTokenSource _cts;
+        private Thread _workerThread;
+        private readonly ManualResetEventSlim _stopped = new ManualResetEventSlim(false);
+
+        private AppConfig        _cfg;
+        private ApiClient        _api;
+        private SystemCollector  _collector;
+        private TaskExecutor     _executor;
+        private WsClient         _wsClient;
+        private RemoteScreen     _remoteScreen;
+        private TcpInputClient   _inputClient;
+        private string           _expectedSessionToken;  // 远程桌面一次性 token，viewer 连接时验证
+        private SessionManager   _sessionMgr;
+
+        // 推迟中的任务：target_id → 到期时间
+        private readonly Dictionary<int, DateTime> _deferred = new Dictionary<int, DateTime>();
+        private readonly object _deferLock = new object();
+
+        private DateTime _lastReportDate = DateTime.MinValue;
+        private DateTime _lastTaskPoll   = DateTime.MinValue;
+        private readonly SemaphoreSlim _taskPushSignal = new SemaphoreSlim(0, 1);
+
+        // SessionManager 触发立即检查 Tray（用户登录时唤醒主循环）
+        private readonly SemaphoreSlim _trayCheckSignal = new SemaphoreSlim(0, 1);
+
+        //  停止超时常量，统一管理
+        private const int STOP_WAIT_MS = 15_000;
+
+        public AgentService()
+        {
+            ServiceName         = "ITAsset4Agent";
+            CanStop             = true;
+            CanPauseAndContinue = false;
+            AutoLog             = true;
+        }
+
+        // ── ServiceBase 生命周期 ──────────────────────────────────────────────
+        protected override void OnStart(string[] args)
+        {
+            try
+            {
+                _cts = new CancellationTokenSource();
+                _stopped.Reset();
+                _workerThread = new Thread(() => RunAsync(_cts.Token).GetAwaiter().GetResult())
+                {
+                    IsBackground = true,
+                    Name         = "ITAsset4Worker"
+                };
+                _workerThread.Start();
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[FATAL] OnStart 启动工作线程失败: {ex.Message}");
+                Logger.Error($"[FATAL] 堆栈: {ex.StackTrace}");
+                throw; // 让 SCM 知道启动失败
+            }
+        }
+
+        protected override void OnStop()
+        {
+            Logger.Info("收到停止信号，开始优雅退出...");
+
+            //  向 SCM 申报额外等待时间，防止 SCM 在等待期间判定"停止失败"
+            // SCM 默认超时 ~20s，我们申报 STOP_WAIT_MS + 3s 缓冲
+            RequestAdditionalTime(STOP_WAIT_MS + 3_000);
+
+            _cts?.Cancel();               // 唤醒所有 await ct 的等待
+            PipeHelper.CancelAll();       // 取消所有 Pipe 等待
+
+            // 不在 OnStop 里单独 Dispose inputClient，统一在 RunAsync finally 里清理
+            // 避免双重 Dispose 竞态（RunAsync finally 也会 Dispose）
+
+            if (!_stopped.Wait(STOP_WAIT_MS))
+                Logger.Warn($"OnStop {STOP_WAIT_MS / 1000}s 超时，强制退出");
+        }
+
+        protected override void OnShutdown()
+        {
+            Logger.Info("收到系统关机信号，优雅停止...");
+            // 关机时 SCM 给的窗口更短，申报同样的额外时间
+            RequestAdditionalTime(STOP_WAIT_MS + 3_000);
+            _cts?.Cancel();
+            PipeHelper.CancelAll();
+            _stopped.Wait(STOP_WAIT_MS);
+        }
+
+        // ── 控制台调试模式入口 ────────────────────────────────────────────────
+        public void StartConsole(string[] args) => OnStart(args);
+        public void StopConsole()               => OnStop();
+        public void WaitForStop()               => _stopped.Wait();
+
+        // ── 主逻辑 ────────────────────────────────────────────────────────────
+        private async Task RunAsync(CancellationToken ct)
+        {
+            try
+            {
+                Logger.Info("==== ITAsset4 Agent v1.0.0 启动 ====");
+
+                string cfgPath = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "ITAsset4", "config.ini");
+
+                if (!System.IO.File.Exists(cfgPath))
+                {
+                    AppConfig.WriteDefault(cfgPath);
+                    Logger.Info($"已生成默认配置: {cfgPath}");
+                }
+
+                _cfg       = AppConfig.Load(cfgPath);
+                _api       = new ApiClient(_cfg);
+                _collector = new SystemCollector();
+                _executor  = new TaskExecutor(_cfg);
+
+                //  启动 Session 管理器（用户登录时自动拉起 Tray）
+                // 订阅事件，用户登录时立即唤醒主循环检查 Tray，不再等最长 1 分钟
+                _sessionMgr = new SessionManager();
+                _sessionMgr.OnTrayNeeded += () =>
+                {
+                    Logger.Info("[SessionMgr] 收到 OnTrayNeeded 信号，唤醒主循环立即检查 Tray");
+                    if (_trayCheckSignal.CurrentCount == 0)
+                        _trayCheckSignal.Release();
+                };
+                _sessionMgr.Start();
+
+                // ── 注册（首次或重置后）：失败则每 5 分钟重试 ────────────────
+                while (!_api.IsRegistered && !ct.IsCancellationRequested)
+                {
+                    var info = _collector.Collect();
+                    Logger.Info("首次运行，开始注册设备...");
+                    bool ok = await _api.RegisterAsync(info.serial, info.hostname, info.ip, info.bios_serial, info.machine_guid);
+                    if (ok)
+                    {
+                        Logger.Info("注册成功！");
+                        break;
+                    }
+                    Logger.Error("注册失败，5 分钟后重试...");
+                    await DelayAsync(TimeSpan.FromMinutes(5), ct);
+                }
+
+                if (ct.IsCancellationRequested) return;
+
+                // ── 初始化 InputPipeClient（持久输入连接）────────────────────
+                _inputClient = new TcpInputClient();
+                Logger.Info("InputPipeClient 已创建");
+
+                // ── 注册成功，先建 WS（远程桌面立即可用），再上报 ─────
+                {
+                    var info = _collector.Collect();
+                    string secret = DeviceAuth.LoadDeviceSecret();
+                    if (secret != null)
+                    {
+                        _wsClient = new WsClient(_cfg);
+                        _wsClient.OnTaskPush += async (taskName) =>
+                        {
+                            Logger.Info($"WS 推送触发立即拉取任务: {taskName}");
+                            _taskPushSignal.Release();
+                            try { await FetchAndRunTasksAsync(info.serial, ct); }
+                            catch (Exception ex) { Logger.Error($"WS 触发拉取失败: {ex.Message}"); }
+                        };
+
+                        _wsClient.OnMessage += async (msgType, rawJson) =>
+                        {
+                            try
+                            {
+                                if (msgType == "remote_start")
+                                {
+                                    //  安全改进：只存储 session_token，不立即启动截图
+                                    // viewer 连接后发 viewer_connected + token，Agent 验证通过才启动
+                                    var token = (string)JObject.Parse(rawJson)["session_token"];
+                                    _expectedSessionToken = token;
+                                    Logger.Info($"[Remote] received remote_start, token={token?.Substring(0, Math.Min(12, token?.Length ?? 0))}..., awaiting viewer_connected");
+                                    if (_remoteScreen == null)
+                                        _remoteScreen = new RemoteScreen(_wsClient, TcpScreenClient.SendAsync);
+                                }
+                                else if (msgType == "viewer_connected")
+                                {
+                                    // viewer 连接确认：验证 session_token 一致后才启动截图
+                                    var token = (string)JObject.Parse(rawJson)["session_token"];
+                                    if (!string.IsNullOrEmpty(_expectedSessionToken)
+                                        && _expectedSessionToken == token)
+                                    {
+                                        Logger.Info("[Remote] viewer_connected token 验证通过，启动远程桌面");
+                                        if (!_remoteScreen.IsRunning)
+                                            _remoteScreen.Start();
+                                    }
+                                    else
+                                    {
+                                        Logger.Warn($"[Remote] viewer_connected token 不匹配! expected={_expectedSessionToken?.Substring(0, Math.Min(12, _expectedSessionToken?.Length ?? 0))}..., got={token?.Substring(0, Math.Min(12, token?.Length ?? 0))}...");
+                                    }
+                                }
+                                else if (msgType == "remote_stop")
+                                {
+                                    Logger.Info("[Remote] received remote_stop command");
+                                    _expectedSessionToken = null;
+                                    _remoteScreen?.Stop();
+                                }
+                                else if (msgType == "remote_input")
+                                {
+                                    var rim = Newtonsoft.Json.JsonConvert.DeserializeObject<RemoteInputMsg>(rawJson);
+                                    if (rim != null)
+                                    {
+                                        if (rim.event_type == "click") return;
+
+                                        
+                                        var pr = new PipeRequest
+                                        {
+                                            type         = "remote_input",
+                                            event_type   = rim.event_type,
+                                            button       = rim.button,
+                                            mouse_x      = rim.mouse_x,
+                                            mouse_y      = rim.mouse_y,
+                                            scroll_delta = rim.scroll_delta,
+                                        };
+
+                                        // 通知 RemoteScreen 升帧率
+                                        _remoteScreen?.NotifyInput();
+
+                                        // 走专用输入 Pipe（持久连接，不阻塞截图）
+                                        await _inputClient.SendInputAsync(pr);
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error($"[Remote] handler error: {ex}");
+                            }
+                        };
+
+                        // WS fire-and-forget：不等握手，远程桌面立即可用
+                        //  ContinueWith 捕获未观察的异常
+                        _ = _wsClient.ConnectAsync(info.serial, secret).ContinueWith(t =>
+                        {
+                            if (t.IsFaulted && t.Exception != null)
+                                Logger.Error($"WS 后台连接失败: {t.Exception.InnerException?.Message}");
+                        }, TaskContinuationOptions.OnlyOnFaulted);
+
+                        Logger.Info("WS 启动中（后台），开始防惊群延迟上报...");
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                int jitter;
+                                lock (_randLock) { jitter = _rand.Next(0, _cfg.JitterMax); }
+                                await Task.Delay(TimeSpan.FromSeconds(jitter));
+                                await ReportAndFetchTasksAsync(info, _cts.Token);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Error($"延迟上报失败: {ex.Message}");
+                            }
+                        });
+                    }
+                }
+
+                // ── 主循环 ─────────────────────────────────────────────────────
+                //  Delay 改为 30s（原 1 分钟），同时监听三路唤醒信号：
+                //   1. 定时 30s（保底轮询）
+                //   2. _taskPushSignal（WS 推送任务）
+                //   3. _trayCheckSignal（SessionManager 检测到用户登录）
+                while (!ct.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.WhenAny(
+                            Task.Delay(TimeSpan.FromSeconds(30), ct),
+                            _taskPushSignal.WaitAsync(ct),
+                            _trayCheckSignal.WaitAsync(ct)
+                        ).ConfigureAwait(false);
+                    }
+                    catch (ObjectDisposedException) { break; }
+                    if (ct.IsCancellationRequested) break;
+
+                    try { await TickAsync(ct); }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex) { Logger.Error($"主循环异常: {ex.Message}"); }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Logger.Error($"Agent 异常退出: {ex.Message}");
+                Logger.Error($"堆栈: {ex.StackTrace}");
+            }
+            finally
+            {
+                //  统一清理顺序
+                // 1. 先停截图循环（避免它继续占用 TcpScreenClient）
+                // 2. 再停输入客户端
+                // 3. 再停 WS（截图/输入都停了才关 WS）
+                // 4. 最后停 SessionMgr、Api
+                Logger.Info("==== ITAsset4 Agent 开始清理 ====");
+                try { _remoteScreen?.Stop(); } catch (Exception ex) { Logger.Warn($"RemoteScreen Stop 异常: {ex.Message}"); }
+                try { _inputClient?.Dispose(); } catch (Exception ex) { Logger.Warn($"InputClient Dispose 异常: {ex.Message}"); }
+                try { PipeHelper.CancelAll(); } catch { }
+                try { _sessionMgr?.Dispose(); } catch (Exception ex) { Logger.Warn($"SessionMgr Dispose 异常: {ex.Message}"); }
+                try { _wsClient?.Dispose(); } catch (Exception ex) { Logger.Warn($"WsClient Dispose 异常: {ex.Message}"); }
+                try { _api?.Dispose(); } catch (Exception ex) { Logger.Warn($"Api Dispose 异常: {ex.Message}"); }
+                Logger.Info("==== ITAsset4 Agent 停止 ====");
+                _stopped.Set();
+            }
+        }
+
+        private static async Task DelayAsync(TimeSpan delay, CancellationToken ct)
+        {
+            try { await Task.Delay(delay, ct); }
+            catch (TaskCanceledException) { }
+        }
+
+        private async Task TickAsync(CancellationToken ct)
+        {
+            // 每次循环检查 Tray 是否在正确 Session 中运行
+            _sessionMgr?.CheckAndLaunchTray();
+
+            var now          = DateTime.Now;
+            var targetReport = ParseTime(_cfg.ReportTime);
+
+            // 每日资产上报（固定时间点，1 分钟窗口内触发一次）
+            bool shouldReport = (now.TimeOfDay >= targetReport
+                              && now.TimeOfDay <= targetReport.Add(TimeSpan.FromMinutes(1)))
+                              && _lastReportDate.Date != now.Date;
+            if (shouldReport)
+            {
+                _lastReportDate = now;
+                Logger.Info("======== 每日资产上报 ========");
+                var info = _collector.Collect();
+                await _api.ReportAsync(info);
+            }
+
+            // 每 10 分钟拉取一次任务
+            if ((now - _lastTaskPoll).TotalMinutes >= 10)
+            {
+                if (await IsServerReachableAsync(_cfg))
+                {
+                    _lastTaskPoll = now;
+                    
+                    var info = _collector.Collect();
+                    await FetchAndRunTasksAsync(info.serial, ct);
+                }
+                else
+                {
+                    Logger.Warn("服务器不可达，跳过本次任务拉取");
+                }
+            }
+
+            await CheckDeferredAsync(ct);
+        }
+
+        private static async Task<bool> IsServerReachableAsync(AppConfig cfg)
+        {
+            try
+            {
+                var uri = new Uri(cfg.ServerUrl);
+                string host = uri.Host;
+                int    port = uri.Port > 0 ? uri.Port : (uri.Scheme == "https" ? 443 : 80);
+
+                using (var client = new System.Net.Sockets.TcpClient())
+                {
+                    var task = client.ConnectAsync(host, port);
+                    if (await Task.WhenAny(task, Task.Delay(3000)) == task)
+                    {
+                        client.Close();
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            catch { return false; }
+        }
+
+        private static TimeSpan ParseTime(string time)
+        {
+            var parts = time.Split(':');
+            int h = parts.Length >= 1 && int.TryParse(parts[0], out var hh) ? hh : 0;
+            int m = parts.Length >= 2 && int.TryParse(parts[1], out var mm) ? mm : 0;
+            return new TimeSpan(h, m, 0);
+        }
+
+        private async Task ReportAndFetchTasksAsync(SystemInfo info, CancellationToken ct)
+        {
+            await _api.ReportAsync(info);
+            await FetchAndRunTasksAsync(info.serial, ct);
+        }
+
+        private async Task FetchAndRunTasksAsync(string serial, CancellationToken ct)
+        {
+            var tasks = await _api.FetchTasksAsync(serial);
+            if (tasks.Count > 0) Logger.Info($"拉取到 {tasks.Count} 个任务");
+
+            foreach (var task in tasks)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                lock (_deferLock)
+                {
+                    if (_deferred.ContainsKey(task.target_id))
+                    {
+                        Logger.Info($"[任务 {task.target_id}] 推迟中，跳过");
+                        continue;
+                    }
+                }
+
+                //  每个 fire-and-forget 追加 ContinueWith 兜底异常记录
+                _ = RunTaskAsync(task, serial, ct).ContinueWith(t =>
+                {
+                    if (t.IsFaulted && t.Exception != null)
+                        Logger.Error($"[任务 {task.target_id}] 未处理异常: {t.Exception.InnerException?.Message}");
+                }, TaskContinuationOptions.OnlyOnFaulted);
+            }
+        }
+
+        private async Task RunTaskAsync(TaskInfo task, string serial, CancellationToken ct)
+        {
+            string deviceSecret = DeviceAuth.LoadDeviceSecret();
+            if (deviceSecret == null)
+            {
+                Logger.Warn("DeviceSecret 未找到，跳过任务");
+                return;
+            }
+
+            TaskResult result;
+            try
+            {
+                result = await _executor.ExecuteAsync(task, serial, deviceSecret);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[任务 {task.target_id}] 执行异常: {ex.Message}");
+                result = new TaskResult { success = false, message = ex.Message };
+            }
+
+            if (result.deferred)
+            {
+                int deferMins = task.defer_minutes > 0 ? task.defer_minutes : 60;
+                lock (_deferLock)
+                    _deferred[task.target_id] = DateTime.Now.AddMinutes(deferMins);
+                Logger.Info($"[任务 {task.target_id}] 已推迟，{deferMins} 分钟后重试");
+            }
+            else
+            {
+                await _api.ReportResultAsync(task.target_id, result, serial);
+
+                if (!string.IsNullOrEmpty(result.install_log))
+                    await _api.UploadLogAsync(task.target_id, result.install_log, serial);
+
+                string auditPath = task.task_type == "uninstall"
+                    ? (task.uninstall_target ?? "uninstall")
+                    : (task.package_filename ?? "unknown");
+                string auditArgs = task.task_type == "uninstall" ? "uninstall" : task.silent_args;
+                await _api.ReportAuditAsync(serial, auditPath, auditArgs,
+                    null, result.exit_code, DateTime.UtcNow);
+            }
+        }
+
+        private async Task CheckDeferredAsync(CancellationToken ct)
+        {
+            var ready = new List<int>();
+            lock (_deferLock)
+            {
+                var now = DateTime.Now;
+                foreach (var kv in _deferred)
+                    if (now >= kv.Value) ready.Add(kv.Key);
+                foreach (var id in ready) _deferred.Remove(id);
+            }
+
+            foreach (int targetId in ready)
+            {
+                Logger.Info($"推迟任务 target_id={targetId} 到期，重新拉取执行");
+                var serial = new SystemCollector().Collect().serial;
+                await FetchAndRunTasksAsync(serial, ct);
+                break;
+            }
+        }
+    }
+}
