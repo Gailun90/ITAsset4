@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net48</TargetFramework>
     <LangVersion>9.0</LangVersion>
-    <Nullable>enable</Nullable>
+    <Nullable>annotations</Nullable>
     <AssemblyName>ITAsset4.Common</AssemblyName>
     <RootNamespace>ITAsset4.Common</RootNamespace>
   </PropertyGroup>

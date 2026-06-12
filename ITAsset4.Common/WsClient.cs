@@ -21,33 +21,34 @@ namespace ITAsset4.Common
     public class WsClient : IDisposable
     {
         private readonly AppConfig _cfg;
-        private string _serial;
-        private string _deviceSecret;
+        private string _serial = default!;
+        private string _deviceSecret = default!;
 
         private readonly CancellationTokenSource _lifetimeCts = new CancellationTokenSource();
-        private CancellationTokenSource _sessionCts;
+        private CancellationTokenSource _sessionCts = default!;
         private readonly ConcurrentQueue<string> _sendQueue = new ConcurrentQueue<string>();
 
-        private volatile byte[] _latestFrame;
+        private volatile byte[] _latestFrame = default!;
         private readonly SemaphoreSlim _sendLock   = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _frameSignal = new SemaphoreSlim(0, 1);
-        private ClientWebSocket _currentWs;
+        private ClientWebSocket _currentWs = default!;
 
-        private Task _connectLoopTask;
+        private Task _connectLoopTask = default!;
 
-        public event Action<string> OnTaskPush;
+        public event Action<string>? OnTaskPush;
 
         // 改为 Func<Task>，让订阅者可以正确 await 异步操作
         // 原 Action<string,string> 导致 async lambda 变成 async void，异常被吞，await 被丢弃
-        public event Func<string, string, Task> OnMessage;
+        public event Func<string, string, Task>? OnMessage;
 
         public WsClient(AppConfig cfg) { _cfg = cfg; }
 
-        public async Task SendAsync(string message)
+        public Task SendAsync(string message)
         {
             _sendQueue.Enqueue(message);
             if (_frameSignal.CurrentCount == 0)
                 _frameSignal.Release();
+            return Task.CompletedTask;
         }
 
         public void SendBytesAsync(byte[] data)

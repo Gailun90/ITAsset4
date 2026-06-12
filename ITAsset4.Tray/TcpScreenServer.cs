@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -18,18 +18,31 @@ namespace ITAsset4.Tray
     /// TcpScreenServer — 在 localhost:15900 提供截图+弹窗服务
     /// 协议: TcpFrameHelper (4字节大端长度前缀帧)
     /// 短连接模式，每次请求→响应后关闭
+    /// 
+    /// v6.0: 支持 TCP 认证（连接后客户端必须先发送 AUTH &lt;token&gt;）
     /// </summary>
     public class TcpScreenServer
     {
-        private TcpListener _listener;
-        private CancellationTokenSource _cts;
+        private TcpListener _listener = default!;
+        private CancellationTokenSource _cts = default!;
         private const int PORT = 15900;
+
+        // v6.0: TCP 认证 Token
+        private readonly string _authToken;
+
+        /// <summary>
+        /// v6.0: 创建 TcpScreenServer（支持认证）
+        /// </summary>
+        public TcpScreenServer(string authToken = null)
+        {
+            _authToken = authToken;
+        }
 
         public void Start()
         {
             _cts = new CancellationTokenSource();
             Task.Run(() => AcceptLoop(_cts.Token));
-            Logger.Info($"[TcpScreen] 已启动 127.0.0.1:{PORT} TraySession={Process.GetCurrentProcess().SessionId}");
+            Logger.Info($"[TcpScreen] 已启动 127.0.0.1:{PORT} TraySession={Process.GetCurrentProcess().SessionId} (Auth: {(!string.IsNullOrEmpty(_authToken) ? "enabled" : "disabled")})");
         }
 
         public void Stop()
@@ -68,6 +81,28 @@ namespace ITAsset4.Tray
                 try
                 {
                     var stream = client.GetStream();
+                    
+                    // v6.0: TCP 认证（如果配置了 token）
+                    if (!string.IsNullOrEmpty(_authToken))
+                    {
+                        // 读取认证消息（带超时）
+                        using var authCts = new CancellationTokenSource(5000); // 5秒超时
+                        string authLine = await TcpFrameHelper.ReadFrameAsync(stream, authCts.Token);
+                        
+                        if (string.IsNullOrEmpty(authLine) || authLine != $"AUTH {_authToken}")
+                        {
+                            Logger.Warn($"[TcpScreen] 认证失败: {authLine?.Substring(0, Math.Min(20, authLine?.Length ?? 0))}...");
+                            // 发送认证失败响应
+                            try { await TcpFrameHelper.WriteFrameAsync(stream, "ERROR invalid auth", CancellationToken.None); } catch { }
+                            return;
+                        }
+                        
+                        // 认证成功，发送 OK
+                        await TcpFrameHelper.WriteFrameAsync(stream, "OK", CancellationToken.None);
+                        Logger.Info("[TcpScreen] TCP 认证成功");
+                    }
+
+                    // 继续处理正常请求
                     string reqJson = await TcpFrameHelper.ReadFrameAsync(stream, ct);
                     if (string.IsNullOrEmpty(reqJson)) return;
 
@@ -95,9 +130,9 @@ namespace ITAsset4.Tray
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════
         // 截图 — GDI CopyFromScreen → JPEG base64
-        // ═══════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════
 
         private static PipeResponse CaptureScreen(PipeRequest req)
         {
@@ -158,9 +193,9 @@ namespace ITAsset4.Tray
             return null;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════
         // UI 弹窗
-        // ═══════════════════════════════════════════════════════════════════
+        // ═════════════════════════════════════════════════════════════════
 
         private static Task<PipeResponse> ProcessUiRequestAsync(PipeRequest req)
         {

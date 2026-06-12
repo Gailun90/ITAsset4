@@ -63,16 +63,18 @@ namespace ITAsset4.Common
         /// <summary>
         /// 初始注册 Token：
         ///   优先读取 config.ini [server] initial_token；
-        ///   若未配置则回退内置默认值（需与服务端 .env AGENT_INITIAL_TOKEN 一致）。
+        ///   若未配置则抛出异常（不再使用硬编码默认值）。
         /// </summary>
         public string InitialToken
         {
             get
             {
-                string fromCfg = Get("server", "initial_token", "");
-                return string.IsNullOrWhiteSpace(fromCfg)
-                    ? "a3f8b2c1-9d4e-5f6a-7b8c-0d1e2f3a4b5c"
-                    : fromCfg;
+                string fromCfg = Get("server", "initial_token", "").Trim();
+                if (string.IsNullOrWhiteSpace(fromCfg))
+                    throw new InvalidOperationException(
+                        "配置错误：config.ini [server] initial_token 未设置。" +
+                        "请设置与服务端 AGENT_INITIAL_TOKEN 一致的值。");
+                return fromCfg;
             }
         }
 

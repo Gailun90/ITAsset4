@@ -13,6 +13,8 @@ namespace ITAsset4.Service
     ///   发生时立即触发事件通知 AgentWorker 主循环，不再等最长 1 分钟的轮询间隔
     /// - 后台线程改用 WTSWaitSystemEvent 阻塞等待，CPU 占用为零
     /// - CheckAndLaunchTray() 保留，供主循环兜底轮询
+    /// 
+    /// v6.0: 支持通过命令行参数传递 TCP 认证 Token 给 Tray
     /// </summary>
     public class SessionManager : IDisposable
     {
@@ -23,10 +25,13 @@ namespace ITAsset4.Service
         private static readonly TimeSpan MinLaunchInterval = TimeSpan.FromSeconds(90);
 
         // 用户登录/Session 切换时触发，通知 AgentWorker 立即调用 CheckAndLaunchTray
-        public event Action OnTrayNeeded;
+        public event Action? OnTrayNeeded;
 
-        private CancellationTokenSource _watchCts;
-        private Thread _watchThread;
+        private CancellationTokenSource _watchCts = default!;
+        private Thread _watchThread = default!;
+
+        // v6.0: TCP 认证 Token，启动 Tray 时通过命令行参数传递
+        private string _tcpAuthToken = default!;
 
         public SessionManager()
         {
@@ -38,6 +43,18 @@ namespace ITAsset4.Service
                 if (File.Exists(alt)) _trayExePath = Path.GetFullPath(alt);
             }
             Logger.Info($"[SessionMgr] 已初始化, Tray={_trayExePath}");
+        }
+
+        /// <summary>
+        /// v6.0: 设置 TCP 认证 Token（由 AgentWorker 在启动前调用）
+        /// </summary>
+        public void SetAuthToken(string token)
+        {
+            lock (_lock)
+            {
+                _tcpAuthToken = token;
+            }
+            Logger.Info($"[SessionMgr] TCP Auth Token 已设置（不记录到日志）");  // 🔒 修复问题27：不再记录 token 任何部分
         }
 
         /// <summary>
@@ -77,8 +94,12 @@ namespace ITAsset4.Service
                 return;
             }
 
+            // v6.0: 获取 auth token 用于传递给 Tray
+            string authToken;
+            lock (_lock) { authToken = _tcpAuthToken; }
+
             Logger.Info($"[SessionMgr] Tray 未运行（Session={sid}），准备启动...");
-            bool launched = LaunchProcessInSession(sid, _trayExePath);
+            bool launched = LaunchProcessInSession(sid, _trayExePath, authToken);
             if (launched)
             {
                 lock (_lock) { _lastLaunchedSession = sid; _lastLaunchTime = DateTime.Now; }
@@ -90,12 +111,12 @@ namespace ITAsset4.Service
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
         // 后台监听 WTS Session 事件（登录 / 解锁 / Session 切换）
         //
         // WTSWaitSystemEvent 阻塞直到指定事件发生，CPU 占用为零。
         // 相比 Task.Delay(1分钟) 轮询，响应时间从最坏 60s 降到 ~1s。
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
 
         // 监听的事件掩码（WTS_EVENT_*）
         // 0x00000002 = WTS_EVENT_LOGON（用户登录）
@@ -154,11 +175,14 @@ namespace ITAsset4.Service
             Logger.Info("[SessionMgr] WTS 监听线程已退出");
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
         // CreateProcessAsUser
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
 
-        public static bool LaunchProcessInSession(int sessionId, string exePath, string args = "")
+        /// <summary>
+        /// v6.0: 支持传入 authToken，通过命令行参数 --auth-token 传递给 Tray
+        /// </summary>
+        public static bool LaunchProcessInSession(int sessionId, string exePath, string authToken = "")
         {
             IntPtr hUserToken = IntPtr.Zero;
             IntPtr hDupToken  = IntPtr.Zero;
@@ -193,6 +217,13 @@ namespace ITAsset4.Service
                 var pi = new PROCESS_INFORMATION();
                 uint flags = NORMAL_PRIORITY_CLASS;
                 if (hEnvBlock != IntPtr.Zero) flags |= CREATE_UNICODE_ENVIRONMENT;
+
+                // v6.0: 构建命令行，包含 auth token
+                string args = "";
+                if (!string.IsNullOrEmpty(authToken))
+                {
+                    args = $"--auth-token {authToken}";
+                }
 
                 string cmdLine = $"\"{exePath}\" {args}".Trim();
                 bool ok = CreateProcessAsUser(hDupToken, null, cmdLine,
@@ -249,9 +280,9 @@ namespace ITAsset4.Service
             return false;
         }
 
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
         // P/Invoke
-        // ═══════════════════════════════════════════════════════════════════
+        // ═══════════════════════════════════════════════════════════════
 
         [DllImport("wtsapi32.dll", SetLastError = true)]
         private static extern bool WTSQueryUserToken(uint sid, out IntPtr phToken);

@@ -10,30 +10,40 @@ namespace ITAsset4.Tray
     ///   - TcpScreenServer :15900（截图+弹窗）
     ///   - TcpInputServer  :15901（鼠标输入）
     /// 无 Session 依赖，端口固定，Service 通过 127.0.0.1 连接
+    /// 
+    /// v6.0: 支持 TCP 认证（接收 authToken 并传递给 Server）
     /// </summary>
     public class TrayApplicationContext : ApplicationContext
     {
         private readonly TcpScreenServer _screenServer;
         private readonly TcpInputServer _inputServer;
 
-        public TrayApplicationContext()
+        // v6.0: TCP 认证 Token
+        private readonly string _authToken;
+
+        /// <summary>
+        /// v6.0: 构造函数接受 authToken
+        /// </summary>
+        public TrayApplicationContext(string authToken = null)
         {
+            _authToken = authToken;
+
             //  Start dedicated input worker BEFORE servers
             PipeServer.StartInputWorker();
 
-            _screenServer = new TcpScreenServer();
+            _screenServer = new TcpScreenServer(_authToken);  // v6.0: 传入 authToken
             _screenServer.Start();
 
-            _inputServer = new TcpInputServer();
+            _inputServer = new TcpInputServer(_authToken);    // v6.0: 传入 authToken
             _inputServer.Start();
 
-            Logger.Info("Tray 应用已启动");
+            Logger.Info($"Tray 应用已启动 (TCP Auth: {(!string.IsNullOrEmpty(_authToken) ? "enabled" : "disabled")})");
         }
 
         protected override void ExitThreadCore()
         {
-            _inputServer.Stop();
-            _screenServer.Stop();
+            _inputServer?.Stop();
+            _screenServer?.Stop();
             PipeServer.StopInputWorker();
             base.ExitThreadCore();
         }

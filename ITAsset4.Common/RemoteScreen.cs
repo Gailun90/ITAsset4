@@ -14,8 +14,8 @@ namespace ITAsset4.Common
     {
         private readonly WsClient _ws;
         private readonly Func<PipeRequest, Task<PipeResponse>> _pipeSend;
-        private CancellationTokenSource _cts;
-        private Task _loopTask;
+        private CancellationTokenSource _cts = default!;
+        private Task _loopTask = default!;
         private volatile bool _running;
         private int _frameSeq;
 

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ServiceProcess;
 using System.Threading;
@@ -16,25 +16,31 @@ namespace ITAsset4.Service
     ///   - 停止等待从 8s 延长为 15s，与 RemoteScreen/TcpScreenClient 最长超时对齐
     ///   - 主循环 Task.Delay 缩短为 30s 并监听 SessionManager 触发信号，解决 Tray 启动延迟最长 1 分钟问题
     ///   - SessionManager 新增 OnTrayNeeded 事件，用户登录时立即通知主循环
+    /// 
+    /// v6.0: 支持 TCP 认证（生成 token 并传递给 Tray 和 Client）
     /// </summary>
     public class AgentService : ServiceBase
     {
         private static readonly Random _rand = new Random();
         private static readonly object _randLock = new object();
 
-        private CancellationTokenSource _cts;
-        private Thread _workerThread;
+        private CancellationTokenSource _cts = default!;
+        private Thread _workerThread = default!;
         private readonly ManualResetEventSlim _stopped = new ManualResetEventSlim(false);
 
-        private AppConfig        _cfg;
-        private ApiClient        _api;
-        private SystemCollector  _collector;
-        private TaskExecutor     _executor;
-        private WsClient         _wsClient;
-        private RemoteScreen     _remoteScreen;
-        private TcpInputClient   _inputClient;
-        private string           _expectedSessionToken;  // 远程桌面一次性 token，viewer 连接时验证
-        private SessionManager   _sessionMgr;
+        private AppConfig        _cfg = default!;
+        private ApiClient        _api = default!;
+        private SystemCollector  _collector = default!;
+        private TaskExecutor     _executor = default!;
+        private WsClient         _wsClient = default!;
+        private RemoteScreen     _remoteScreen = default!;
+        private TcpScreenClient _screenClient = default!;   // v6.0: TCP 认证 Client
+        private TcpInputClient   _inputClient = default!;
+        private string           _expectedSessionToken = default!;  // 远程桌面一次性 token，viewer 连接时验证
+        private SessionManager   _sessionMgr = default!;
+        
+        // v6.0: TCP 认证 Token
+        private string           _tcpAuthToken = default!;
 
         // 推迟中的任务：target_id → 到期时间
         private readonly Dictionary<int, DateTime> _deferred = new Dictionary<int, DateTime>();
@@ -133,11 +139,22 @@ namespace ITAsset4.Service
                 _cfg       = AppConfig.Load(cfgPath);
                 _api       = new ApiClient(_cfg);
                 _collector = new SystemCollector();
-                _executor  = new TaskExecutor(_cfg);
+                // v6.1: 传入 UI 委托（用于 interactive/deferred/reboot 弹窗）
+                // _screenClient 可能在 WS remote_start 之后才创建，所以用延迟委托
+                // v6.2: 传入审计上报委托（修复 8B：ReportAuditAsync 死代码）
+                _executor  = new TaskExecutor(
+                    _cfg,
+                    uiSender: req => SendToTrayAsync(req),
+                    auditReporter: (path, args, pid, exitCode, at) => ReportAuditSafeAsync(path, args, pid, exitCode, at));
+
+                // v6.0: 生成 TCP 认证 Token
+                _tcpAuthToken = Guid.NewGuid().ToString("N");
+                Logger.Info($"[TCP Auth] Token 已生成: {_tcpAuthToken.Substring(0, Math.Min(8, _tcpAuthToken.Length))}...");
 
                 //  启动 Session 管理器（用户登录时自动拉起 Tray）
                 // 订阅事件，用户登录时立即唤醒主循环检查 Tray，不再等最长 1 分钟
                 _sessionMgr = new SessionManager();
+                _sessionMgr.SetAuthToken(_tcpAuthToken);  // v6.0: 设置 TCP 认证 Token
                 _sessionMgr.OnTrayNeeded += () =>
                 {
                     Logger.Info("[SessionMgr] 收到 OnTrayNeeded 信号，唤醒主循环立即检查 Tray");
@@ -163,9 +180,9 @@ namespace ITAsset4.Service
 
                 if (ct.IsCancellationRequested) return;
 
-                // ── 初始化 InputPipeClient（持久输入连接）────────────────────
-                _inputClient = new TcpInputClient();
-                Logger.Info("InputPipeClient 已创建");
+                // ── 初始化 TcpInputClient（持久输入连接）────────────────────
+                _inputClient = new TcpInputClient(_tcpAuthToken);  // v6.0: 传入认证 Token
+                Logger.Info("TcpInputClient 已创建");
 
                 // ── 注册成功，先建 WS（远程桌面立即可用），再上报 ─────
                 {
@@ -192,9 +209,12 @@ namespace ITAsset4.Service
                                     // viewer 连接后发 viewer_connected + token，Agent 验证通过才启动
                                     var token = (string)JObject.Parse(rawJson)["session_token"];
                                     _expectedSessionToken = token;
-                                    Logger.Info($"[Remote] received remote_start, token={token?.Substring(0, Math.Min(12, token?.Length ?? 0))}..., awaiting viewer_connected");
+                                    Logger.Info($"[Remote] received remote_start, token verified (not logged)");  // 🔒 修复问题27：不再记录 token
+                                    
+                                    // v6.0: 创建 RemoteScreen 时传入认证 Token
+                                    _screenClient = new TcpScreenClient(_tcpAuthToken);
                                     if (_remoteScreen == null)
-                                        _remoteScreen = new RemoteScreen(_wsClient, TcpScreenClient.SendAsync);
+                                        _remoteScreen = new RemoteScreen(_wsClient, req => _screenClient.SendAsync(req));
                                 }
                                 else if (msgType == "viewer_connected")
                                 {
@@ -209,7 +229,7 @@ namespace ITAsset4.Service
                                     }
                                     else
                                     {
-                                        Logger.Warn($"[Remote] viewer_connected token 不匹配! expected={_expectedSessionToken?.Substring(0, Math.Min(12, _expectedSessionToken?.Length ?? 0))}..., got={token?.Substring(0, Math.Min(12, token?.Length ?? 0))}...");
+                                        Logger.Warn($"[Remote] viewer_connected token 不匹配! (details not logged)");  // 🔒 修复问题27：不再记录 token
                                     }
                                 }
                                 else if (msgType == "remote_stop")
@@ -239,7 +259,7 @@ namespace ITAsset4.Service
                                         // 通知 RemoteScreen 升帧率
                                         _remoteScreen?.NotifyInput();
 
-                                        // 走专用输入 Pipe（持久连接，不阻塞截图）
+                                        // 走专用输入 TcpClient（持久连接，不阻塞截图）
                                         await _inputClient.SendInputAsync(pr);
                                     }
                                 }
@@ -330,6 +350,46 @@ namespace ITAsset4.Service
             catch (TaskCanceledException) { }
         }
 
+        /// <summary>
+        /// 延迟 UI 请求委托：通过 TcpScreenClient 发送 ASK_INSTALL/ASK_REBOOT 到 Tray
+        /// _screenClient 可能在 remote_start 之后才创建，所以需要动态检查
+        /// </summary>
+        private async Task<PipeResponse> SendToTrayAsync(PipeRequest req)
+        {
+            // 优先走 TCP (TcpScreenClient)，如果还没初始化则降级到 Pipe
+            if (_screenClient != null)
+            {
+                var resp = await _screenClient.SendAsync(req);
+                if (resp != null) return resp;
+            }
+
+            // TCP 不可用 → 尝试 Named Pipe（兼容 Tray 已启动但 WS 未连接的场景）
+            Logger.Info($"[UI] TCP ScreenClient 不可用，尝试 Pipe: {req.type}");
+            return await PipeHelper.SendAsync(req);
+        }
+
+        /// <summary>
+        /// 安全审计上报（修复 8B：TaskExecutor 执行进程后回调此方法）
+        /// 内部调用 ApiClient.ReportAuditAsync，失败不抛异常
+        /// </summary>
+        private async Task ReportAuditSafeAsync(string processPath, string args,
+            int? pid, int? exitCode, DateTime executedAt)
+        {
+            if (!_api.IsRegistered) return;
+            try
+            {
+                string serial = _collector?.Collect()?.serial;
+                if (string.IsNullOrEmpty(serial)) return;
+                await _api.ReportAuditAsync(serial, processPath, args, pid, exitCode, executedAt);
+                Logger.Info($"[审计] 已上报: {System.IO.Path.GetFileName(processPath)} exit={exitCode}");
+            }
+            catch (Exception ex)
+            {
+                // 审计上报失败不影响任务流程
+                Logger.Warn($"[审计] 上报失败: {ex.Message}");
+            }
+        }
+
         private async Task TickAsync(CancellationToken ct)
         {
             // 每次循环检查 Tray 是否在正确 Session 中运行
@@ -340,8 +400,8 @@ namespace ITAsset4.Service
 
             // 每日资产上报（固定时间点，1 分钟窗口内触发一次）
             bool shouldReport = (now.TimeOfDay >= targetReport
-                              && now.TimeOfDay <= targetReport.Add(TimeSpan.FromMinutes(1)))
-                              && _lastReportDate.Date != now.Date;
+                                  && now.TimeOfDay <= targetReport.Add(TimeSpan.FromMinutes(1)))
+                                  && _lastReportDate.Date != now.Date;
             if (shouldReport)
             {
                 _lastReportDate = now;
@@ -357,7 +417,20 @@ namespace ITAsset4.Service
                 {
                     _lastTaskPoll = now;
                     
+                    // 🔒 问题16 修复：重试之前失败的上报
+                    await _api.RetryPendingResults();
+                    
+                    // ⭐ 每10分钟上报软件清单（捕获非本系统安装的软件变更）
                     var info = _collector.Collect();
+                    try
+                    {
+                        await _api.ReportAsync(info);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"定时上报软件清单失败: {ex.Message}");
+                    }
+                    
                     await FetchAndRunTasksAsync(info.serial, ct);
                 }
                 else
@@ -472,6 +545,18 @@ namespace ITAsset4.Service
                 string auditArgs = task.task_type == "uninstall" ? "uninstall" : task.silent_args;
                 await _api.ReportAuditAsync(serial, auditPath, auditArgs,
                     null, result.exit_code, DateTime.UtcNow);
+
+                // ⭐ 任务完成后立即同步软件清单
+                try
+                {
+                    var reportInfo = _collector.Collect();
+                    await _api.ReportAsync(reportInfo);
+                    Logger.Info($"[任务 {task.target_id}] 软件清单已同步上报");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"[任务 {task.target_id}] 同步上报软件清单失败: {ex.Message}");
+                }
             }
         }
 

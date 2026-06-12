@@ -239,8 +239,8 @@ namespace ITAsset4.Tray
 
         private static readonly BlockingCollection<PipeRequest> _inputQueue =
             new BlockingCollection<PipeRequest>(new ConcurrentQueue<PipeRequest>());
-        private static Thread _inputWorkerThread;
-        private static CancellationTokenSource _inputWorkerCts;
+        private static Thread _inputWorkerThread = default!;
+        private static CancellationTokenSource _inputWorkerCts = default!;
         private static string _inputWorkerDesktopName = "";
         private static readonly object _inputWorkerLock = new object();
 

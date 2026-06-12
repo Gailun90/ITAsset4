@@ -1,5 +1,6 @@
 using System;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using ITAsset4.Common;
@@ -12,14 +13,16 @@ namespace ITAsset4.Service
     /// - SendInputAsync 加发送超时（3s），防止 WriteAsync 永久阻塞吃掉锁
     /// - Heartbeat 改为独立 TcpClient，不再与发送共用同一把锁，彻底消除锁竞争
     /// - 增加详细诊断日志：锁等待耗时、发送耗时、连接状态
+    /// 
+    /// v6.0: 支持 TCP 认证（连接后先发送 AUTH &lt;token&gt;）
     /// </summary>
     public class TcpInputClient : IDisposable
     {
-        private TcpClient _client;
-        private NetworkStream _stream;
+        private TcpClient _client = default!;
+        private NetworkStream _stream = default!;
         private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
-        private CancellationTokenSource _hbCts;
-        private Task _hbTask;
+        private CancellationTokenSource _hbCts = default!;
+        private Task _hbTask = default!;
         private volatile bool _disposed;
         private const int PORT = 15901;
         private const int CONNECT_TIMEOUT_MS = 3000;
@@ -28,9 +31,19 @@ namespace ITAsset4.Service
         private static DateTime _lastSendOk = DateTime.MinValue;
         private static readonly object _okLock = new object();
 
+        // v6.0: TCP 认证 Token       
+        private readonly string _authToken;
        
         private int _sendCount;
         private int _sendFail;
+
+        /// <summary>
+        /// v6.0: 创建 TcpInputClient（支持认证）
+        /// </summary>
+        public TcpInputClient(string authToken = null)
+        {
+            _authToken = authToken;
+        }
 
         public async Task SendInputAsync(PipeRequest req)
         {
@@ -122,6 +135,24 @@ namespace ITAsset4.Service
 
             _stream = _client.GetStream();
             Logger.Info("[TcpInput] 已连接");
+            
+            // v6.0: 认证（如果配置了 token）
+            if (!string.IsNullOrEmpty(_authToken))
+            {
+                string authMsg = $"AUTH {_authToken}\n";
+                byte[] authBytes = Encoding.UTF8.GetBytes(authMsg);
+                await _stream.WriteAsync(authBytes, 0, authBytes.Length);
+                
+                // 读取认证响应
+                string authResp = await TcpFrameHelper.ReadFrameAsync(_stream, CancellationToken.None);
+                if (string.IsNullOrEmpty(authResp) || !authResp.StartsWith("OK"))
+                {
+                    Logger.Warn($"[TcpInput] 认证失败: {authResp}");
+                    DropConnection();
+                    throw new Exception("TCP 认证失败");
+                }
+                Logger.Info("[TcpInput] TCP 认证成功");
+            }
 
             // Heartbeat 用独立连接，不竞争发送锁
             StartHeartbeat();
@@ -152,7 +183,22 @@ namespace ITAsset4.Service
                     {
                         var t = probe.ConnectAsync("127.0.0.1", PORT);
                         if (await Task.WhenAny(t, Task.Delay(2000, ct)) == t && probe.Connected)
+                        {
+                            // v6.0: 认证心跳连接
+                            if (!string.IsNullOrEmpty(_authToken))
+                            {
+                                var probeStream = probe.GetStream();
+                                string authMsg = $"AUTH {_authToken}\n";
+                                byte[] authBytes = Encoding.UTF8.GetBytes(authMsg);
+                                await probeStream.WriteAsync(authBytes, 0, authBytes.Length);
+                                string authResp = await TcpFrameHelper.ReadFrameAsync(probeStream, ct);
+                                if (string.IsNullOrEmpty(authResp) || !authResp.StartsWith("OK"))
+                                {
+                                    continue; // 认证失败，认为不 alive
+                                }
+                            }
                             alive = true;
+                        }
                     }
                 }
                 catch { }

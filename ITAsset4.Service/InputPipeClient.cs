@@ -17,10 +17,10 @@ namespace ITAsset4.Service
     /// </summary>
     public class InputPipeClient : IDisposable
     {
-        private NamedPipeClientStream _pipe;
+        private NamedPipeClientStream _pipe = default!;
         private readonly SemaphoreSlim _lock = new SemaphoreSlim(1, 1);
-        private CancellationTokenSource _hbCts;
-        private Task _hbTask;
+        private CancellationTokenSource _hbCts = default!;
+        private Task _hbTask = default!;
         private volatile bool _disposed;
 
         [DllImport("wtsapi32.dll", SetLastError = true)]
