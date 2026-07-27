@@ -27,6 +27,10 @@ namespace ITAsset4.Common
         public int FpsActive { get; set; } = 10;
         private volatile int _activeUntilTick = 0;
 
+        // 屏幕状态（锁屏/登录界面）检测
+        private string _lastScreenState = "";
+        private int _lastStateCheckTick = 0;
+
         public bool IsRunning => _running;
         public int StopTimeoutMs { get; set; } = 3000;
 
@@ -62,6 +66,24 @@ namespace ITAsset4.Common
             _cts?.Cancel();
             try { _loopTask?.Wait(StopTimeoutMs); } catch { }
             Logger.Info($"[Remote] STOPPED (frames={_frameSeq})");
+        }
+
+        /// <summary>
+        /// 将屏幕状态映射为面向前端操作者的提示文案
+        /// </summary>
+        private static string ScreenStateMessage(string state)
+        {
+            switch (state)
+            {
+                case ScreenStateMsg.Locked:
+                    return "客户端处于锁屏 / 登录 / UAC 安全桌面，无法远程输入，请让终端用户解锁后再操作";
+                case ScreenStateMsg.ScreenSaver:
+                    return "客户端处于屏幕保护界面，远程输入可能无效";
+                case ScreenStateMsg.NoDesktop:
+                    return "客户端当前无可交互桌面（如仅显示登录欢迎界面）";
+                default:
+                    return "";
+            }
         }
 
         private async Task CaptureLoopAsync(CancellationToken ct)
@@ -127,6 +149,39 @@ namespace ITAsset4.Common
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex) { Logger.Error($"[Remote] frame#{_frameSeq}: {ex.Message}"); }
+
+                // ── 屏幕状态检测（约每秒一次）──
+                // 检测客户端是否处于锁屏/登录/UAC 安全桌面，及时通知前端操作者
+                if (Environment.TickCount - _lastStateCheckTick > 1000)
+                {
+                    _lastStateCheckTick = Environment.TickCount;
+                    try
+                    {
+                        var sreq = new PipeRequest { type = "screen_state" };
+                        var sresp = await _pipeSend(sreq);
+                        if (sresp != null && !string.IsNullOrEmpty(sresp.result))
+                        {
+                            string st = sresp.result;
+                            if (st != _lastScreenState)
+                            {
+                                _lastScreenState = st;
+                                string msg = ScreenStateMessage(st);
+                                await _ws.SendAsync(JsonConvert.SerializeObject(new
+                                {
+                                    type = "remote_screen_state",
+                                    state = st,
+                                    message = msg,
+                                }));
+                                Logger.Info($"[Remote] screen_state 变更: {st}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[Remote] screen_state 查询失败: {ex.Message}");
+                    }
+                }
+
                 try { await Task.Delay(interval, ct); } catch { break; }
             }
         }

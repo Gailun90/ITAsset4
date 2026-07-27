@@ -1,4 +1,6 @@
 using ITAsset4.Common;
+using ITAsset4.Common.Tasks;
+using ITAsset4.Service.TaskHandlers;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -9,6 +11,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
 namespace ITAsset4.Service
 {
@@ -28,6 +31,20 @@ namespace ITAsset4.Service
         // 黑名单：防止命令注入的特殊字符（修复 8A：原来定义但从未使用）
         private static readonly Regex BlacklistRegex =
             new Regex(@"[\r\n`""<>|&^]", RegexOptions.Compiled);
+
+        // P0 安全：禁止重启/关机关键词黑名单（服务端+客户端两端共享规则）
+        // 纵深防御：服务端已经拦过一次，但客户端作为最后防线必须独立检查
+        // 注意：Restart-Computer/Stop-Computer 必须在 \brestart\b 前面，
+        //       否则 bare restart 会先捕获 Restart-Computer 中的 restart 前缀
+        private static readonly Regex RebootBlacklist =
+            new Regex(
+                @"Restart-Computer|Stop-Computer" +
+                @"|wuauclt\s+/restart" +
+                @"|shutdown\.exe" +
+                @"|\bshutdown\b" +
+                @"|\breboot\b" +
+                @"|\brestart\b",
+                RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         // 卸载成功的退出码
         private static readonly int[] UninstallSuccessCodes =
@@ -49,20 +66,37 @@ namespace ITAsset4.Service
         }
 
         // ═══════════════════════════════════════════════
-        // 主入口
+        // 主入口 — 使用 TaskHandlerFactory 策略模式分发
         // ═══════════════════════════════════════════════
         public async Task<TaskResult> ExecuteAsync(TaskInfo task, string serial, string deviceSecret)
         {
             Logger.Info($"[任务 {task.target_id}] {task.task_name} (interactive={task.interactive}, type={task.task_type})");
 
-            // ── 卸载任务 ───────────────────────────────────────
-            if (task.task_type == "uninstall")
-                return await ExecuteUninstallAsync(task);
+            var factory = new TaskHandlerFactory();
+            factory.Register(new InstallHandler());
+            factory.Register(new UninstallHandler());
+            factory.Register(new RunCommandHandler());
+            factory.Register(new RegistryHandler());
+            factory.Register(new CleanupHandler());
 
-            // ── 安装任务：interactive 检查（修复：原来完全无视 task.interactive）──
+            var ctx = new TaskContext(task, _cfg, null!, default,
+                _uiSender, _auditReporter, serial, deviceSecret);
+
+            return await factory.ExecuteAsync(ctx);
+        }
+
+        // ═══════════════════════════════════════════════
+        // Install（提取自原 ExecuteAsync 安装分支）
+        // ═══════════════════════════════════════════════
+        internal static async Task<TaskResult> ExecuteInstallAsync(
+            TaskInfo task, Downloader dl, string serial, string deviceSecret,
+            Func<PipeRequest, Task<PipeResponse>> uiSender,
+            Func<string, string, int?, int?, DateTime, Task> auditReporter)
+        {
+            // ── 安装任务：interactive 检查 ──
             if (task.interactive)
             {
-                var userChoice = await AskUserInstallAsync(task);
+                var userChoice = await AskUserInstallAsync(task, uiSender);
                 if (userChoice == "DEFERRED")
                 {
                     Logger.Info($"[任务 {task.target_id}] 用户选择推迟安装");
@@ -73,19 +107,18 @@ namespace ITAsset4.Service
                     Logger.Info($"[任务 {task.target_id}] 用户取消安装");
                     return new TaskResult { success = false, message = "用户取消安装" };
                 }
-                // userChoice == "OK" → 继续执行安装
                 Logger.Info($"[任务 {task.target_id}] 用户确认，开始安装");
             }
 
             // ── 下载 + 执行安装 ───────────────────────────────
-            string pkgPath = await _dl.DownloadAsync(
+            string pkgPath = await dl.DownloadAsync(
                 task.download_url,
                 task.package_filename,
                 serial,
                 deviceSecret,
                 task.package_hash);
 
-            var run = await RunProcessAsync(pkgPath, task.silent_args, task.timeout, _auditReporter);
+            var run = await RunProcessAsync(pkgPath, task.silent_args, task.timeout, auditReporter);
 
             // ── 判断成功/失败（含重启退出码检测）────────────────
             bool success;
@@ -96,18 +129,18 @@ namespace ITAsset4.Service
             else
                 success = run.ExitCode == 0 || needsReboot;
 
-            // ── 需要重启时询问用户（修复：原来只有卸载处理 3010）──
+            // ── 需要重启时询问用户 ──
             if (success && needsReboot)
             {
                 Logger.Info($"[任务 {task.target_id}] 安装需要重启 (exit code {run.ExitCode})");
 
                 var rebootChoice = await AskUserRebootAsync(
-                    task.package_filename ?? task.task_name ?? "软件");
+                    task.package_filename ?? task.task_name ?? "软件", uiSender);
                 var rebootAction = rebootChoice switch
                 {
                     "now"    => "reboot_now",
                     "later"  => "reboot_required",
-                    _        => "reboot_required",  // cancel → 标记需要但不强制
+                    _        => "reboot_required",
                 };
 
                 return new TaskResult
@@ -132,15 +165,18 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // ⭐ 卸载（三层结构重构）
         // ═══════════════════════════════════════════════
-        private async Task<TaskResult> ExecuteUninstallAsync(TaskInfo task)
+        internal static async Task<TaskResult> ExecuteUninstallAsync(
+            TaskInfo task,
+            Func<PipeRequest, Task<PipeResponse>> uiSender,
+            Func<string, string, int?, int?, DateTime, Task> auditReporter)
         {
             string swName = task.uninstall_target;
             Logger.Info($"卸载任务: {swName}");
 
-            // ── interactive 检查（修复：原来完全无视 task.interactive）──
+            // ── interactive 检查 ──
             if (task.interactive)
             {
-                var userChoice = await AskUserInstallAsync(task);
+                var userChoice = await AskUserInstallAsync(task, uiSender);
                 if (userChoice == "DEFERRED")
                 {
                     Logger.Info($"[任务 {task.target_id}] 用户选择推迟卸载");
@@ -169,18 +205,18 @@ namespace ITAsset4.Service
             }
 
             // ===== L2: 执行卸载 =====
-            var exec = await ExecuteTargets(targets, task.timeout);
+            var exec = await ExecuteTargets(targets, task.timeout, auditReporter);
 
-            // ===== L3: 统一验证（修复：检测重启退出码）=====
+            // ===== L3: 统一验证 =====
             bool needsReboot = RebootRequiredCodes.Contains(exec.ExitCode);
             bool success = VerifyUninstall(swName, exec.ExitCode);
 
-            // ── 需要重启时询问用户 ──────────────────────────────
+            // ── 需要重启时询问用户 ──
             if (success && needsReboot)
             {
                 Logger.Info($"[任务 {task.target_id}] 卸载需要重启 (exit code {exec.ExitCode})");
 
-                var rebootChoice = await AskUserRebootAsync(swName);
+                var rebootChoice = await AskUserRebootAsync(swName, uiSender);
                 var rebootAction = rebootChoice switch
                 {
                     "now"    => "reboot_now",
@@ -208,9 +244,420 @@ namespace ITAsset4.Service
         }
 
         // ═══════════════════════════════════════════════
-        // L1: 获取卸载目标（重写：优先 QuietUninstallString）
+        // ⭐ 命令类任务（run_command / registry / cleanup）
+        //    由服务端下发，已通过设备认证，属于受信管理指令。
         // ═══════════════════════════════════════════════
-        private List<(string exe, string args, string dir, string name)>
+
+        #region 命令类任务 DTO
+        private class RegistryOpDto
+        {
+            public string action { get; set; } = "set";
+            public string root   { get; set; } = "HKLM";
+            public string subkey { get; set; } = "";
+            public string name   { get; set; } = "";
+            public string value  { get; set; } = "";
+            public string type   { get; set; } = "string";
+            // 写入前原值快照（读原值时挂到本 op，避免与 ops 列表按索引错位配对）
+            public object before { get; set; } = null;
+        }
+        private class CleanupPathDto
+        {
+            public string path      { get; set; } = "";
+            public bool   recursive { get; set; }
+        }
+        #endregion
+
+        // ── run_command：写入临时脚本并以 cmd/powershell 执行 ──────
+        internal static async Task<TaskResult> ExecuteCommandAsync(
+            TaskInfo task,
+            Func<string, string, int?, int?, DateTime, Task> auditReporter)
+        {
+            Logger.Info($"[命令任务 {task.target_id}] 执行脚本 (interpreter={task.interpreter}, run_as={task.run_as})");
+
+            string ext = (task.interpreter ?? "").ToLower() == "powershell" ? "ps1" : "bat";
+            string file = Path.Combine(Path.GetTempPath(), $"itasset_cmd_{Guid.NewGuid():N}.{ext}");
+            try
+            {
+                File.WriteAllText(file, task.command ?? "", Encoding.UTF8);
+
+                // ── P0 安全纵深防御：客户端独立扫描重启/关机关键词 ──
+                var rebootHit = RebootBlacklist.Match(task.command ?? "");
+                if (rebootHit.Success)
+                {
+                    Logger.Error($"[安全 命令任务 {task.target_id}] 命令包含禁止的重启/关机操作，拒绝执行。命中: {rebootHit.Value}");
+                    return new TaskResult
+                    {
+                        success    = false,
+                        exit_code  = -1,
+                        message    = $"SECURITY_BLOCKED: 命令包含禁止的重启/关机操作（命中: {rebootHit.Value}）",
+                    };
+                }
+
+                string exe, args;
+                if ((task.interpreter ?? "").ToLower() == "powershell")
+                {
+                    exe  = "powershell.exe";
+                    args = $"-ExecutionPolicy Bypass -NoProfile -File \"{file}\"";
+                }
+                else
+                {
+                    exe  = "cmd.exe";
+                    args = $"/c \"{file}\"";
+                }
+
+                var run = await RunProcessAsync(exe, args, task.timeout, auditReporter,
+                    applySecurityCheck: false);
+
+                bool success = task.success_codes != null && task.success_codes.Count > 0
+                    ? task.success_codes.Contains(run.ExitCode)
+                    : run.ExitCode == 0;
+
+                return new TaskResult
+                {
+                    success    = success,
+                    exit_code  = run.ExitCode,
+                    message    = success ? "脚本执行成功" : $"脚本执行失败 (exit={run.ExitCode})",
+                    install_log = run.Log,
+                };
+            }
+            catch (Exception ex)
+            {
+                return new TaskResult { success = false, message = $"脚本准备失败: {ex.Message}" };
+            }
+            finally
+            {
+                try { if (File.Exists(file)) File.Delete(file); } catch { }
+            }
+        }
+
+        // ── registry：应用注册表操作（HKLM 或 目标用户 HKCU）────
+        internal static async Task<TaskResult> ExecuteRegistryAsync(TaskInfo task)
+        {
+            Logger.Info($"[注册表任务 {task.target_id}] 应用注册表操作 (run_as={task.run_as})");
+
+            List<RegistryOpDto> ops;
+            try
+            {
+                ops = Newtonsoft.Json.JsonConvert.DeserializeObject<List<RegistryOpDto>>(
+                    task.registry_ops ?? "[]") ?? new List<RegistryOpDto>();
+            }
+            catch (Exception ex)
+            {
+                return new TaskResult { success = false, message = $"注册表操作解析失败: {ex.Message}" };
+            }
+
+            if (ops.Count == 0)
+                return new TaskResult { success = false, message = "注册表操作为空" };
+
+            // ── 读取写入前的原值，直接挂到对应 op（避免按索引配对错位）──
+            foreach (var op in ops)
+            {
+                try
+                {
+                    RegistryKey root = op.root == "HKCU" ? OpenTargetHkcu(task.run_as) : Registry.LocalMachine;
+                    if (root == null) continue;
+                    using (var sk = root.OpenSubKey(op.subkey))
+                    {
+                        if (sk != null && !string.IsNullOrEmpty(op.name))
+                        {
+                            var beforeVal = sk.GetValue(op.name);
+                            var beforeKind = sk.GetValueKind(op.name);
+                            op.before = new
+                            {
+                                op = "read_before",
+                                root = op.root,
+                                subkey = op.subkey,
+                                name = op.name,
+                                value = beforeVal?.ToString() ?? "",
+                                type = beforeKind.ToString(),
+                            };
+                        }
+                        // name 为空（删除整个子键）或键不存在时 before 保持 null；
+                        // 回滚/校验按 before==null 处理，不再与 ops 索引错位配对。
+                    }
+                }
+                catch { /* 读原值失败不阻塞主流程 */ }
+            }
+
+            var sb = new StringBuilder();
+            bool allOk = true;
+            foreach (var op in ops)
+            {
+                try
+                {
+                    RegistryKey root = op.root == "HKCU" ? OpenTargetHkcu(task.run_as) : Registry.LocalMachine;
+                    if (root == null) { sb.AppendLine($"[SKIP] 无法打开根键 {op.root}"); allOk = false; continue; }
+                    bool writableRoot = op.root != "HKCU";
+                    using (var actualRoot = writableRoot ? root : root)
+                    {
+                        sb.AppendLine("  " + ApplyRegistryOp(op, actualRoot));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    allOk = false;
+                    sb.AppendLine($"[ERROR] {op.subkey}\\{op.name}: {ex.Message}");
+                }
+            }
+
+            // ── 写入后读回验证（遍历所有 ops，使用 op.before 配对，不再按索引）──
+            object verifySnapshot = null;
+            {
+                var verifiedOps = new List<object>();
+                foreach (var op in ops)
+                {
+                    try
+                    {
+                        RegistryKey root = op.root == "HKCU" ? OpenTargetHkcu(task.run_as) : Registry.LocalMachine;
+                        if (root != null && !string.IsNullOrEmpty(op.name))
+                        {
+                            using (var sk = root.OpenSubKey(op.subkey))
+                            {
+                                var afterVal = sk?.GetValue(op.name);
+                                verifiedOps.Add(new
+                                {
+                                    before = op.before,
+                                    after = new
+                                    {
+                                        root = op.root,
+                                        subkey = op.subkey,
+                                        name = op.name,
+                                        value = afterVal?.ToString() ?? "",
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    catch { /* 读回失败不阻塞 */ }
+                }
+                if (verifiedOps.Count > 0)
+                {
+                    verifySnapshot = new { ops = verifiedOps };
+                }
+            }
+
+            return new TaskResult
+            {
+                success    = allOk,
+                exit_code  = allOk ? 0 : 1,
+                message    = allOk ? "注册表操作全部成功" : "部分注册表操作失败",
+                install_log = sb.ToString(),
+                verify_snapshot = verifySnapshot,
+            };
+        }
+
+        private static string ApplyRegistryOp(RegistryOpDto op, RegistryKey root)
+        {
+            string target = $"{op.root}\\{op.subkey}" + (string.IsNullOrEmpty(op.name) ? "" : $"\\{op.name}");
+
+            if ((op.action ?? "set").ToLower() == "delete")
+            {
+                using var sk = root.OpenSubKey(op.subkey, writable: true);
+                if (sk == null) return $"[DELETE 跳过] 不存在: {target}";
+                if (string.IsNullOrEmpty(op.name))
+                {
+                    root.DeleteSubKeyTree(op.subkey, throwOnMissingSubKey: false);
+                    return $"[DELETE 子键] {target}";
+                }
+                sk.DeleteValue(op.name, throwOnMissingValue: false);
+                return $"[DELETE 值] {target}";
+            }
+
+            // set
+            using var wsk = root.CreateSubKey(op.subkey, writable: true);
+            if (wsk == null) return $"[SET 失败] 无法创建子键: {op.root}\\{op.subkey}";
+
+            string kind = (op.type ?? "string").ToLower();
+            if (kind == "dword")
+            {
+                if (int.TryParse(op.value, out var dv)) wsk.SetValue(op.name, dv, RegistryValueKind.DWord);
+                else return $"[SET 失败] 非整数 dword: {target}={op.value}";
+            }
+            else if (kind == "qword")
+            {
+                if (long.TryParse(op.value, out var qv)) wsk.SetValue(op.name, qv, RegistryValueKind.QWord);
+                else return $"[SET 失败] 非整数 qword: {target}={op.value}";
+            }
+            else if (kind == "expand")
+            {
+                wsk.SetValue(op.name, op.value ?? "", RegistryValueKind.ExpandString);
+            }
+            else
+            {
+                wsk.SetValue(op.name, op.value ?? "", RegistryValueKind.String);
+            }
+            return $"[SET] {target} = {op.value} ({kind})";
+        }
+
+        // ── cleanup：删除指定文件/目录（带安全校验）────────────
+        internal static async Task<TaskResult> ExecuteCleanupAsync(TaskInfo task)
+        {
+            Logger.Info($"[清理任务 {task.target_id}] 删除文件/目录");
+
+            List<CleanupPathDto> items;
+            try
+            {
+                items = Newtonsoft.Json.JsonConvert.DeserializeObject<List<CleanupPathDto>>(
+                    task.cleanup_paths ?? "[]") ?? new List<CleanupPathDto>();
+            }
+            catch (Exception ex)
+            {
+                return new TaskResult { success = false, message = $"清理列表解析失败: {ex.Message}" };
+            }
+
+            if (items.Count == 0)
+                return new TaskResult { success = false, message = "清理列表为空" };
+
+            var sb = new StringBuilder();
+            bool allOk = true;
+            foreach (var it in items)
+            {
+                string p = (it.path ?? "").Trim();
+                if (!IsPathSafeToDelete(p))
+                {
+                    sb.AppendLine($"[SKIP 不安全] {p}");
+                    allOk = false;
+                    continue;
+                }
+                try
+                {
+                    if (File.Exists(p))
+                    {
+                        File.Delete(p);
+                        sb.AppendLine($"[删除文件] {p}");
+                    }
+                    else if (Directory.Exists(p))
+                    {
+                        Directory.Delete(p, it.recursive);
+                        sb.AppendLine($"[删除目录{(it.recursive ? "(递归)" : "")}] {p}");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"[跳过 不存在] {p}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    allOk = false;
+                    sb.AppendLine($"[ERROR] {p}: {ex.Message}");
+                }
+            }
+
+            return new TaskResult
+            {
+                success    = allOk,
+                exit_code  = allOk ? 0 : 1,
+                message    = allOk ? "清理完成" : "部分清理失败",
+                install_log = sb.ToString(),
+            };
+        }
+
+        /// <summary>
+        /// 清理路径安全校验：拒绝系统/程序目录、盘符根、空路径等，防止误删系统。
+        /// </summary>
+        internal static bool IsPathSafeToDelete(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+            try
+            {
+                string full = Path.GetFullPath(path);
+                string driveRoot = Path.GetPathRoot(full);
+                if (full.TrimEnd('\\', '/') == driveRoot.TrimEnd('\\', '/')) return false;
+
+                string[] protectedDirs =
+                {
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    Environment.GetEnvironmentVariable("SystemRoot") ?? "",
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                    Environment.GetFolderPath(Environment.SpecialFolder.System),
+                };
+                foreach (var d in protectedDirs)
+                {
+                    if (!string.IsNullOrEmpty(d) &&
+                        full.StartsWith(d.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                        return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // ── HKCU 上下文解析：run_as=user 时打开交互登录用户的配置单元 ──
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        private static extern bool WTSQueryUserToken(uint sessionId, out IntPtr phToken);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool ConvertSidToStringSid(IntPtr pSid, out IntPtr ptr);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetTokenInformation(IntPtr hToken, int tokenInformationClass,
+            IntPtr tokenInformation, int tokenInfoLength, out int returnLength);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr hMem);
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr h);
+
+        internal static RegistryKey OpenTargetHkcu(string runAs)
+        {
+            if (string.IsNullOrEmpty(runAs) || runAs.ToLower() != "user")
+                return Registry.CurrentUser;
+
+            try
+            {
+                int sid = SessionManager.GetActiveUserSessionId();
+                if (sid < 0)
+                {
+                    Logger.Warn("[Registry] 无活动会话，HKCU 回退到 SYSTEM 配置单元");
+                    return Registry.CurrentUser;
+                }
+                if (!WTSQueryUserToken((uint)sid, out IntPtr hToken))
+                {
+                    Logger.Warn($"[Registry] WTSQueryUserToken 失败 0x{Marshal.GetLastWin32Error():X8}");
+                    return Registry.CurrentUser;
+                }
+                try
+                {
+                    const int TOKEN_USER = 1;
+                    GetTokenInformation(hToken, TOKEN_USER, IntPtr.Zero, 0, out int needed);
+                    IntPtr buf = Marshal.AllocHGlobal(needed);
+                    try
+                    {
+                        if (!GetTokenInformation(hToken, TOKEN_USER, buf, needed, out _))
+                        {
+                            Logger.Warn("[Registry] GetTokenInformation 失败");
+                            return Registry.CurrentUser;
+                        }
+                        IntPtr pSid = Marshal.ReadIntPtr(buf);
+                        if (!ConvertSidToStringSid(pSid, out IntPtr pSidStr))
+                        {
+                            Logger.Warn("[Registry] ConvertSidToStringSid 失败");
+                            return Registry.CurrentUser;
+                        }
+                        string sidStr = Marshal.PtrToStringAuto(pSidStr);
+                        LocalFree(pSidStr);
+                        var key = Registry.Users.OpenSubKey(sidStr, writable: true);
+                        if (key != null)
+                        {
+                            Logger.Info($"[Registry] 已打开交互用户 HKCU: {sidStr}");
+                            return key;
+                        }
+                        Logger.Warn($"[Registry] 打开用户 HKCU 失败(配置单元可能未加载): {sidStr}");
+                        return Registry.CurrentUser;
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+                finally { CloseHandle(hToken); }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[Registry] 解析用户 HKCU 异常: {ex.Message}");
+                return Registry.CurrentUser;
+            }
+        }
+
+        // ═══════════════════════════════════════════════
+        // L1: 获取卸载目标
+        // ═══════════════════════════════════════════════
+        internal static List<(string exe, string args, string dir, string name)>
             GetUninstallTargets(string swName)
         {
             var list = FindAllUninstallInfos(swName);
@@ -218,7 +665,6 @@ namespace ITAsset4.Service
             if (list.Count > 0)
                 return list;
 
-            // 回退：尝试从注册表找 GUID（仅当子键名是 GUID 格式时）
             string guid = FindProductGuidInRegistry(swName);
             if (!string.IsNullOrEmpty(guid))
             {
@@ -232,7 +678,7 @@ namespace ITAsset4.Service
         }
 
         // ═══════════════════════════════════════════════
-        // 从注册表查找卸载信息（重写：支持 QuietUninstallString）
+        // 从注册表查找卸载信息
         // ═══════════════════════════════════════════════
         private static List<(string exe, string args, string dir, string name)>
             FindAllUninstallInfos(string softwareName)
@@ -267,7 +713,6 @@ namespace ITAsset4.Service
 
                         string installDir = sk.GetValue("InstallLocation") as string ?? "";
 
-                        // ✅ 优先1：QuietUninstallString（静默卸载命令）
                         string quietUninstall = sk.GetValue("QuietUninstallString") as string;
                         if (!string.IsNullOrEmpty(quietUninstall))
                         {
@@ -276,7 +721,6 @@ namespace ITAsset4.Service
                             continue;
                         }
 
-                        // ✅ 优先2：UninstallString + 推断静默参数
                         string uninstallString = sk.GetValue("UninstallString") as string;
                         if (!string.IsNullOrEmpty(uninstallString))
                         {
@@ -286,7 +730,6 @@ namespace ITAsset4.Service
                             continue;
                         }
 
-                        // ✅ 最后：回退到 msiexec（仅当 sub 是 GUID 格式）
                         if (IsGuid(sub))
                         {
                             result.Add(("msiexec", $"/x {sub} /qn /norestart", installDir, name));
@@ -302,11 +745,10 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // 解析卸载字符串：分离 exe 和 args
         // ═══════════════════════════════════════════════
-        private static (string exe, string args) ParseUninstallString(string uninstallString)
+        internal static (string exe, string args) ParseUninstallString(string uninstallString)
         {
             uninstallString = uninstallString.Trim();
 
-            // 处理带引号的路径: "C:\Path\uninstall.exe" /S
             if (uninstallString.StartsWith("\""))
             {
                 int endQuote = uninstallString.IndexOf('"', 1);
@@ -318,7 +760,6 @@ namespace ITAsset4.Service
                 }
             }
 
-            // 无引号: C:\Path\uninstall.exe /S
             int spaceIdx = uninstallString.IndexOf(' ');
             if (spaceIdx > 0)
             {
@@ -336,21 +777,17 @@ namespace ITAsset4.Service
         {
             string ext = Path.GetExtension(exe).ToLower();
 
-            // NSIS 安装包
             if (originalArgs.IndexOf("/SILENT", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 originalArgs.IndexOf("/VERYSILENT", StringComparison.OrdinalIgnoreCase) >= 0)
                 return originalArgs;
 
-            // Inno Setup 安装包
             if (originalArgs.IndexOf("/SILENT", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 originalArgs.IndexOf("/VERYSILENT", StringComparison.OrdinalIgnoreCase) >= 0)
                 return originalArgs;
 
-            // MSI 或 msiexec
             if (ext == ".msi" || exe.IndexOf("msiexec", StringComparison.OrdinalIgnoreCase) >= 0)
                 return originalArgs + " /quiet /norestart";
 
-            // EXE 安装包：尝试常见静默参数
             if (originalArgs.IndexOf("/quiet", StringComparison.OrdinalIgnoreCase) < 0 &&
                 originalArgs.IndexOf("/S ", StringComparison.OrdinalIgnoreCase) < 0 &&
                 originalArgs.IndexOf("/SILENT", StringComparison.OrdinalIgnoreCase) < 0)
@@ -359,17 +796,11 @@ namespace ITAsset4.Service
             return originalArgs;
         }
 
-        // ═══════════════════════════════════════════════
-        // 检查字符串是否为 GUID 格式
-        // ═══════════════════════════════════════════════
         private static bool IsGuid(string s)
         {
             return Guid.TryParse(s, out _);
         }
 
-        // ═══════════════════════════════════════════════
-        // 从注册表查找产品 GUID（替代 WMI Win32_Product）
-        // ═══════════════════════════════════════════════
         private static string FindProductGuidInRegistry(string softwareName)
         {
             var regPaths = new[]
@@ -387,7 +818,6 @@ namespace ITAsset4.Service
 
                     foreach (var sub in key.GetSubKeyNames())
                     {
-                        // 只检查 GUID 格式的子键
                         if (!IsGuid(sub)) continue;
 
                         using var sk = key.OpenSubKey(sub);
@@ -395,7 +825,7 @@ namespace ITAsset4.Service
                         if (!string.IsNullOrEmpty(name) &&
                             name.IndexOf(softwareName, StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            return sub; // 返回 GUID
+                            return sub;
                         }
                     }
                 }
@@ -408,9 +838,10 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // L2: 执行卸载
         // ═══════════════════════════════════════════════
-        private async Task<(int ExitCode, string Log)> ExecuteTargets(
+        internal static async Task<(int ExitCode, string Log)> ExecuteTargets(
             List<(string exe, string args, string dir, string name)> targets,
-            int timeout)
+            int timeout,
+            Func<string, string, int?, int?, DateTime, Task> auditReporter)
         {
             var sb = new StringBuilder();
             int last = 0;
@@ -425,7 +856,7 @@ namespace ITAsset4.Service
                     t.exe,
                     t.args,
                     timeout,
-                    _auditReporter);
+                    auditReporter);
 
                 last = r.ExitCode;
                 sb.AppendLine(r.Log);
@@ -438,44 +869,36 @@ namespace ITAsset4.Service
         }
 
         // ═══════════════════════════════════════════════
-        // L3: 统一验证（修复：检查退出码）
+        // L3: 统一验证
         // ═══════════════════════════════════════════════
-        private bool VerifyUninstall(string swName, int exitCode)
+        internal static bool VerifyUninstall(string swName, int exitCode)
         {
-            // ✅ 先检查退出码：0, 19, 3010 等都是成功的
             bool exitCodeOk = UninstallSuccessCodes.Contains(exitCode);
 
             if (exitCode == 3010)
             {
-                // 需要重启：标记为成功，但记录需要重启
                 Logger.Info($"卸载需要重启才能完成 (exit code 3010)");
                 return true;
             }
 
-            // ✅ 等待时间增加到 10 秒
             Thread.Sleep(10000);
 
             var remaining = FindAllUninstallInfos(swName);
             if (remaining.Count == 0)
                 return true;
 
-            // ✅ 更宽松的判断：如果退出码正确，且有注册表项但目录已消失，也认为成功
             bool dirGone = remaining.All(r =>
                 string.IsNullOrEmpty(r.dir) || !Directory.Exists(r.dir));
 
             if (exitCodeOk && dirGone)
                 return true;
 
-            // ✅ 最后尝试：检查注册表是否还存在（更可靠的方法）
             if (exitCodeOk && !IsSoftwareStillInstalled(swName))
                 return true;
 
             return false;
         }
 
-        // ═══════════════════════════════════════════════
-        // 检查软件是否还存在（替代 Win32_Product）
-        // ═══════════════════════════════════════════════
         private static bool IsSoftwareStillInstalled(string softwareName)
         {
             try
@@ -498,7 +921,7 @@ namespace ITAsset4.Service
                         if (!string.IsNullOrEmpty(name) &&
                             name.IndexOf(softwareName, StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            return true; // 还存在
+                            return true;
                         }
                     }
                 }
@@ -511,7 +934,7 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // 进程清理
         // ═══════════════════════════════════════════════
-        private static void KillRelatedProcesses(string softwareName)
+        internal static void KillRelatedProcesses(string softwareName)
         {
             var map = new Dictionary<string, string[]>
             {
@@ -550,24 +973,27 @@ namespace ITAsset4.Service
         }
 
         // ═══════════════════════════════════════════════
-        // 运行进程（修复：正确处理超时，捕获输出）
+        // 运行进程
         // ═══════════════════════════════════════════════
-        private static async Task<(int ExitCode, string Log)> RunProcessAsync(
+        internal static async Task<(int ExitCode, string Log)> RunProcessAsync(
             string fileName, string arguments, int timeoutSec,
-            Func<string, string, int?, int?, DateTime, Task> auditReporter = null)
+            Func<string, string, int?, int?, DateTime, Task> auditReporter = null,
+            bool applySecurityCheck = true)
         {
-            // ── 修复 8A：命令注入防护（BlacklistRegex 终于被使用了）──
-            if (BlacklistRegex.IsMatch(fileName))
+            if (applySecurityCheck)
             {
-                string err = $"[安全] 文件名包含危险字符，拒绝执行: {fileName}";
-                Logger.Error(err);
-                return (-1, $"SECURITY_VIOLATION: {err}");
-            }
-            if (!string.IsNullOrEmpty(arguments) && BlacklistRegex.IsMatch(arguments))
-            {
-                string err = $"[安全] 参数包含危险字符，拒绝执行: {arguments}";
-                Logger.Error(err);
-                return (-1, $"SECURITY_VIOLATION: {err}");
+                if (BlacklistRegex.IsMatch(fileName))
+                {
+                    string err = $"[安全] 文件名包含危险字符，拒绝执行: {fileName}";
+                    Logger.Error(err);
+                    return (-1, $"SECURITY_VIOLATION: {err}");
+                }
+                if (!string.IsNullOrEmpty(arguments) && BlacklistRegex.IsMatch(arguments))
+                {
+                    string err = $"[安全] 参数包含危险字符，拒绝执行: {arguments}";
+                    Logger.Error(err);
+                    return (-1, $"SECURITY_VIOLATION: {err}");
+                }
             }
 
             var si = new ProcessStartInfo
@@ -602,7 +1028,6 @@ namespace ITAsset4.Service
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
 
-                // .NET Framework 4.8 不支持 WaitForExitAsync，用轮询方式
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSec));
                 var deadline = DateTime.Now.AddSeconds(timeoutSec);
                 bool exited;
@@ -621,7 +1046,6 @@ namespace ITAsset4.Service
 
                 if (!exited)
                 {
-                    // 超时：杀进程
                     try
                     {
                         p.Kill();
@@ -629,39 +1053,30 @@ namespace ITAsset4.Service
                     }
                     catch { }
 
-                    // 等待进程完全退出
                     try { p.WaitForExit(); } catch { }
 
                     string log = $"TIMEOUT after {timeoutSec}s (exit code not available)\nSTDOUT:\n{output}\nSTDERR:\n{error}";
-                    // 修复 8B：审计上报（超时场景）
                     _ = FireAuditAsync(auditReporter, fileName, arguments, null, null);
                     return (-1, log);
                 }
 
-                // 等待异步事件缓冲完成
                 try { p.WaitForExit(5000); } catch { }
 
                 string finalLog = $"EXIT CODE: {p.ExitCode}\nSTDOUT:\n{output}\nSTDERR:\n{error}";
-                // 修复 8B：审计上报（正常执行完成）
                 _ = FireAuditAsync(auditReporter, fileName, arguments, p.Id, p.ExitCode);
                 return (p.ExitCode, finalLog);
             }
             catch (Exception ex)
             {
                 string errorLog = $"EXCEPTION: {ex.GetType().Name}: {ex.Message}\nSTDOUT:\n{output}\nSTDERR:\n{error}";
-                // 修复 8B：审计上报（异常场景）
                 _ = FireAuditAsync(auditReporter, fileName, arguments, null, null);
                 return (-1, errorLog);
             }
         }
 
         // ═══════════════════════════════════════════════
-        // 审计上报（修复 8B：Fire-and-forget，不阻塞主流程）
+        // 审计上报
         // ═══════════════════════════════════════════════
-
-        /// <summary>
-        /// 异步触发审计上报，不等待结果，不抛异常
-        /// </summary>
         private static async Task FireAuditAsync(
             Func<string, string, int?, int?, DateTime, Task> reporter,
             string processPath, string args, int? pid, int? exitCode)
@@ -673,26 +1088,25 @@ namespace ITAsset4.Service
             }
             catch (Exception ex)
             {
-                // 审计失败不影响主流程
                 Logger.Warn($"[审计] 上报失败（非致命）: {ex.Message}");
             }
         }
 
         // ═══════════════════════════════════════════════
         // UI 交互：通过 Pipe/TCP 与 Tray 弹窗通信
-        // （修复：原来这些 handler 写了但从未被调用）
         // ═══════════════════════════════════════════════
 
         /// <summary>
         /// 向 Tray 发送安装确认弹窗（ASK_INSTALL）
         /// 返回: "OK"=用户确认, "DEFERRED"=用户推迟, "CANCEL"=用户取消/超时/Tray不可达
         /// </summary>
-        private async Task<string> AskUserInstallAsync(TaskInfo task)
+        internal static async Task<string> AskUserInstallAsync(TaskInfo task,
+            Func<PipeRequest, Task<PipeResponse>> uiSender)
         {
-            if (_uiSender == null)
+            if (uiSender == null)
             {
-                Logger.Warn("[UI] _uiSender 未设置，跳过交互弹窗（静默执行）");
-                return "OK"; // 无 UI 能力时降级为静默执行
+                Logger.Warn("[UI] uiSender 未设置，跳过交互弹窗（静默执行）");
+                return "OK";
             }
 
             try
@@ -706,22 +1120,20 @@ namespace ITAsset4.Service
                 };
 
                 Logger.Info($"[UI] 正在发送 ASK_INSTALL 弹窗请求: {req.app_name}");
-                var resp = await _uiSender(req);
+                var resp = await uiSender(req);
 
                 if (resp == null || string.IsNullOrEmpty(resp.result))
                 {
                     Logger.Warn("[UI] ASK_INSTALL 无响应（Tray 可能未运行），降级为静默执行");
-                    return "OK"; // Tray 不可达 → 降级
+                    return "OK";
                 }
 
                 Logger.Info($"[UI] ASK_INSTALL 用户响应: {resp.result}");
 
-                // UserDialog.AskInstall 返回 "OK"(Yes) 或 "CANCEL"(No/Timeout)
-                // No 对应"推迟"，Cancel(超时) 也视为取消
                 if (resp.result == "OK")
                     return "OK";
                 else
-                    return "DEFERRED"; // 用户点"推迟安装"
+                    return "DEFERRED";
             }
             catch (Exception ex)
             {
@@ -734,11 +1146,12 @@ namespace ITAsset4.Service
         /// 向 Tray 发送重启询问弹窗（ASK_REBOOT）
         /// 返回: "now"/"later"/"cancel"
         /// </summary>
-        private async Task<string> AskUserRebootAsync(string appName)
+        internal static async Task<string> AskUserRebootAsync(string appName,
+            Func<PipeRequest, Task<PipeResponse>> uiSender)
         {
-            if (_uiSender == null)
+            if (uiSender == null)
             {
-                Logger.Info("[UI] _uiSender 未设置，标记需要重启但不弹窗");
+                Logger.Info("[UI] uiSender 未设置，标记需要重启但不弹窗");
                 return "later";
             }
 
@@ -751,7 +1164,7 @@ namespace ITAsset4.Service
                 };
 
                 Logger.Info($"[UI] 正在发送 ASK_REBOOT 请求: {appName}");
-                var resp = await _uiSender(req);
+                var resp = await uiSender(req);
 
                 if (resp == null || string.IsNullOrEmpty(resp.result))
                 {
@@ -760,7 +1173,7 @@ namespace ITAsset4.Service
                 }
 
                 Logger.Info($"[UI] ASK_REBOOT 用户响应: {resp.result}");
-                return resp.result; // "now" | "later" | "cancel"
+                return resp.result;
             }
             catch (Exception ex)
             {

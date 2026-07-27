@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -31,18 +31,11 @@ namespace ITAsset4.Service
         private static DateTime _lastSendOk = DateTime.MinValue;
         private static readonly object _okLock = new object();
 
-        // v6.0: TCP 认证 Token       
-        private readonly string _authToken;
-       
         private int _sendCount;
         private int _sendFail;
 
-        /// <summary>
-        /// v6.0: 创建 TcpInputClient（支持认证）
-        /// </summary>
-        public TcpInputClient(string authToken = null)
+        public TcpInputClient()
         {
-            _authToken = authToken;
         }
 
         public async Task SendInputAsync(PipeRequest req)
@@ -136,23 +129,7 @@ namespace ITAsset4.Service
             _stream = _client.GetStream();
             Logger.Info("[TcpInput] 已连接");
             
-            // v6.0: 认证（如果配置了 token）
-            if (!string.IsNullOrEmpty(_authToken))
-            {
-                string authMsg = $"AUTH {_authToken}\n";
-                byte[] authBytes = Encoding.UTF8.GetBytes(authMsg);
-                await _stream.WriteAsync(authBytes, 0, authBytes.Length);
-                
-                // 读取认证响应
-                string authResp = await TcpFrameHelper.ReadFrameAsync(_stream, CancellationToken.None);
-                if (string.IsNullOrEmpty(authResp) || !authResp.StartsWith("OK"))
-                {
-                    Logger.Warn($"[TcpInput] 认证失败: {authResp}");
-                    DropConnection();
-                    throw new Exception("TCP 认证失败");
-                }
-                Logger.Info("[TcpInput] TCP 认证成功");
-            }
+
 
             // Heartbeat 用独立连接，不竞争发送锁
             StartHeartbeat();
@@ -184,19 +161,6 @@ namespace ITAsset4.Service
                         var t = probe.ConnectAsync("127.0.0.1", PORT);
                         if (await Task.WhenAny(t, Task.Delay(2000, ct)) == t && probe.Connected)
                         {
-                            // v6.0: 认证心跳连接
-                            if (!string.IsNullOrEmpty(_authToken))
-                            {
-                                var probeStream = probe.GetStream();
-                                string authMsg = $"AUTH {_authToken}\n";
-                                byte[] authBytes = Encoding.UTF8.GetBytes(authMsg);
-                                await probeStream.WriteAsync(authBytes, 0, authBytes.Length);
-                                string authResp = await TcpFrameHelper.ReadFrameAsync(probeStream, ct);
-                                if (string.IsNullOrEmpty(authResp) || !authResp.StartsWith("OK"))
-                                {
-                                    continue; // 认证失败，认为不 alive
-                                }
-                            }
                             alive = true;
                         }
                     }

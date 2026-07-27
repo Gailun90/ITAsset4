@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using Newtonsoft.Json;
 
 namespace ITAsset4.Common
 {
@@ -83,6 +84,36 @@ namespace ITAsset4.Common
         public string prompt_text { get; set; } = default!;
         public int defer_minutes { get; set; } = 60;
         public string download_url { get; set; } = "";
+
+        // ── 命令类任务（run_command / registry / cleanup）──────
+        // run_command: 下发的脚本内容（bat / powershell / cmd）
+        public string command { get; set; } = "";
+        // 解释器：bat | cmd | powershell（默认按扩展名推断）
+        public string interpreter { get; set; } = "";
+        // registry: JSON 字符串，元素 {action:set|delete, root:HKLM|HKCU,
+        //          subkey, name, value, type} 列表
+        public string registry_ops { get; set; } = "";
+        // cleanup: JSON 字符串，元素 {path, recursive:bool} 列表（要删除的文件/目录）
+        public string cleanup_paths { get; set; } = "";
+        // 部署前需要清理的进程名列表（由服务端下发，格式 ["wechat","wxwork"]（不含.exe））
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+        public string process_fence { get; set; } = "";
+        // 执行身份：system（默认，SYSTEM 权限）| user（当前登录用户）
+        public string run_as { get; set; } = "system";
+    }
+
+    // ── 屏幕状态（远程桌面锁屏/登录界面检测）──────────────────
+    // Tray 通过 type="screen_state" 的 PipeRequest 返回，result 为下列值之一：
+    //   active      — 正常交互桌面（Default），可操作
+    //   locked      — 锁屏 / 登录 / UAC 安全桌面（Winlogon），无法输入
+    //   screensaver — 屏幕保护中
+    //   no_desktop  — 无可交互桌面（如仅 Welcome 界面）
+    public class ScreenStateMsg
+    {
+        public const string Active     = "active";
+        public const string Locked     = "locked";
+        public const string ScreenSaver = "screensaver";
+        public const string NoDesktop  = "no_desktop";
     }
 
     // ── 任务结果 ──────────────────────────────────────────────────────────────
@@ -94,6 +125,12 @@ namespace ITAsset4.Common
         public string reboot_action { get; set; } = "none";
         public bool deferred { get; set; }
         public string install_log { get; set; } = default!;
+        // ── 状态机补全：Agent 版本 + 后校验快照 ──
+        public string executor_version { get; set; } = default!;
+        // registry_fix: 写入后读回的实际值，用于服务端后校验比对
+        // 结构: { "before": {...}, "after": {...} } 或 null
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+        public object verify_snapshot { get; set; } = default!;
     }
 
     // ── Named Pipe 消息协议 ───────────────────────────────────────────────────

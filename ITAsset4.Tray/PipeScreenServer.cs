@@ -1,11 +1,9 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
+using System.IO.Pipes;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -15,119 +13,122 @@ using Newtonsoft.Json;
 namespace ITAsset4.Tray
 {
     /// <summary>
-    /// TcpScreenServer — 在 localhost:15900 提供截图+弹窗服务
-    /// 协议: TcpFrameHelper (4字节大端长度前缀帧)
-    /// 短连接模式，每次请求→响应后关闭
+    /// PipeScreenServer — 通过命名管道 \\.\pipe\ITAsset4_{sessionId}_Screen
+    /// 提供截图+弹窗服务，替换 TcpScreenServer。
     /// 
+    /// 协议: TcpFrameHelper 二进制帧（兼容旧客户端）
+    /// 单连接模式：一个 Service 连接，断开后自动重连。
     /// </summary>
-    public class TcpScreenServer
+    public class PipeScreenServer
     {
-        private TcpListener _listener = default!;
-        private CancellationTokenSource _cts = default!;
-        private readonly Action _onFatalBind;
-        private const int PORT = 15900;
+        private NamedPipeServerStream _pipe;
+        private CancellationTokenSource _cts;
+        private readonly int _sessionId;
+        private const int MaxFrameRetries = 3;
 
-        public TcpScreenServer(Action onFatalBind = null)
+        public PipeScreenServer()
         {
-            _onFatalBind = onFatalBind;
+            _sessionId = Process.GetCurrentProcess().SessionId;
         }
 
         public void Start()
         {
             _cts = new CancellationTokenSource();
             Task.Run(() => AcceptLoop(_cts.Token));
-            Logger.Info($"[TcpScreen] 已启动 127.0.0.1:{PORT} TraySession={Process.GetCurrentProcess().SessionId} ");
+            Logger.Info($"[PipeScreen] 已启动 \\\\.\\pipe\\ITAsset4_{_sessionId}_Screen");
         }
 
         public void Stop()
         {
             _cts?.Cancel();
-            try { _listener?.Stop(); } catch { }
+            try { _pipe?.Dispose(); } catch { }
+            Logger.Info("[PipeScreen] 已停止");
         }
 
         private async Task AcceptLoop(CancellationToken ct)
         {
-            _listener = new TcpListener(IPAddress.Loopback, PORT);
-            _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-
-            // 绑定失败重试：多用户登录场景下，另一 Session 的 Tray 可能暂占同一端口。
-            // 旧 Tray 的会话看守线程会在数秒内退出并释放端口，这里等待其释放。
-            int retries = 20;
-            bool bound = false;
-            while (retries-- > 0 && !ct.IsCancellationRequested)
-            {
-                try { _listener.Start(); bound = true; break; }
-                catch (SocketException ex)
-                {
-                    Logger.Warn($"[TcpScreen] 绑定 127.0.0.1:{PORT} 失败，1s 后重试: {ex.Message}");
-                    try { await Task.Delay(1000, ct); } catch { break; }
-                }
-            }
-            if (!bound)
-            {
-                // 端口持续被占用（非本 Session 的 Tray）：优雅退出，避免进程崩溃
-                Logger.Error($"[TcpScreen] 端口 {PORT} 持续被占用，Tray 退出以释放冲突");
-                _onFatalBind?.Invoke();
-                return;
-            }
-
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    var client = await _listener.AcceptTcpClientAsync();
-                    _ = Task.Run(() => HandleClientAsync(client, ct));
+                    _pipe = new NamedPipeServerStream(
+                        $"ITAsset4_{_sessionId}_Screen",
+                        PipeDirection.InOut,
+                        1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous);
+                    await _pipe.WaitForConnectionAsync(ct);
+                    Logger.Info("[PipeScreen] Service 已连接");
+                    await ServeClientAsync(_pipe, ct);
                 }
-                catch (ObjectDisposedException) { break; }
                 catch (OperationCanceledException) { break; }
-                catch (Exception ex)
+                catch (Exception ex) { Logger.Warn($"[PipeScreen] accept err: {ex.Message}"); }
+                finally
                 {
-                    Logger.Warn($"[TcpScreen] accept err: {ex.Message}");
-                    try { await Task.Delay(1000, ct); } catch { }
+                    try { _pipe?.Dispose(); } catch { }
+                    _pipe = null;
+                }
+                if (!ct.IsCancellationRequested)
+                {
+                    try { await Task.Delay(1000, ct); } catch { break; }
                 }
             }
         }
 
-        private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+        private async Task ServeClientAsync(NamedPipeServerStream pipe, CancellationToken ct)
         {
-            using (client)
+            int handledCount = 0;
+            try
             {
-                try
+                while (!ct.IsCancellationRequested && pipe.IsConnected)
                 {
-                    var stream = client.GetStream();
-                    
-                    // 处理请求
-                    string reqJson = await TcpFrameHelper.ReadFrameAsync(stream, ct);
-                    if (string.IsNullOrEmpty(reqJson)) return;
-
-                    var req = JsonConvert.DeserializeObject<PipeRequest>(reqJson);
-                    if (req == null) return;
-
-                    PipeResponse resp;
-
-                    if (req.type == "remote_screen")
-                        resp = CaptureScreen(req);
-                    else if (req.type == "screen_state")
-                        resp = new PipeResponse { result = PipeServer.GetScreenState() };
-                    else
-                        resp = await ProcessUiRequestAsync(req);
-
-                    if (resp != null)
+                    try
                     {
-                        string respJson = JsonConvert.SerializeObject(resp);
-                        await TcpFrameHelper.WriteFrameAsync(stream, respJson, ct);
+                        string json = await TcpFrameHelper.ReadFrameAsync((Stream)pipe, ct);
+                        if (string.IsNullOrEmpty(json)) break;
+
+                        var req = JsonConvert.DeserializeObject<PipeRequest>(json);
+                        if (req == null) continue;
+
+                        PipeResponse resp;
+
+                        if (req.type == "remote_screen")
+                            resp = CaptureScreen(req);
+                        else if (req.type == "screen_state")
+                            resp = new PipeResponse { result = PipeServer.GetScreenState() };
+                        else
+                            resp = await ProcessUiRequestAsync(req);
+
+                        if (resp != null)
+                        {
+                            string respJson = JsonConvert.SerializeObject(resp);
+                            await TcpFrameHelper.WriteFrameAsync((Stream)pipe, respJson, ct);
+                        }
+
+                        handledCount++;
+                    }
+                    catch (IOException) { break; }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn($"[PipeScreen] handle err: {ex.Message}");
+                        break;
                     }
                 }
-                catch (Exception ex)
-                {
-                    if (!(ex is IOException))
-                        Logger.Warn($"[TcpScreen] handle err: {ex.Message}");
-                }
+            }
+            catch (Exception ex)
+            {
+                if (!(ex is OperationCanceledException))
+                    Logger.Warn($"[PipeScreen] serve err: {ex.Message}");
+            }
+            finally
+            {
+                Logger.Info($"[PipeScreen] Service 断开 (处理了{handledCount}条请求)");
             }
         }
 
         // ═════════════════════════════════════════════════════════════════
-        // 截图 — GDI CopyFromScreen → JPEG base64
+        // 截图 — GDI CopyFromScreen → JPEG（与 TcpScreenServer 一致）
         // ═════════════════════════════════════════════════════════════════
 
         private static PipeResponse CaptureScreen(PipeRequest req)
@@ -159,7 +160,6 @@ namespace ITAsset4.Tray
                         var jpegEncoder = GetJpegEncoder();
                         var ep = new EncoderParameters(1);
                         ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)quality);
-                        // ★ 先记录尺寸再 Dispose，避免 Dispose 后访问属性
                         int outW = output.Width, outH = output.Height;
                         output.Save(ms, jpegEncoder, ep);
                         if (output != bmp) output.Dispose();

@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITAsset4.Service", "ITAsset
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITAsset4.Tray", "ITAsset4.Tray\ITAsset4.Tray.csproj", "{433C989C-542E-466C-AA7B-131A88979D36}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITAsset4.Updater", "ITAsset4.Updater\ITAsset4.Updater.csproj", "{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -55,6 +57,18 @@ Global
 		{433C989C-542E-466C-AA7B-131A88979D36}.Release|x64.Build.0 = Release|Any CPU
 		{433C989C-542E-466C-AA7B-131A88979D36}.Release|x86.ActiveCfg = Release|Any CPU
 		{433C989C-542E-466C-AA7B-131A88979D36}.Release|x86.Build.0 = Release|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Debug|x64.Build.0 = Debug|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Debug|x86.Build.0 = Debug|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Release|x64.ActiveCfg = Release|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Release|x64.Build.0 = Release|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Release|x86.ActiveCfg = Release|Any CPU
+		{7F5A8B2C-3D4E-5F6A-7B8C-9D0E1F2A3B4C}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

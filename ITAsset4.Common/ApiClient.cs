@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -32,10 +34,54 @@ namespace ITAsset4.Common
         public ApiClient(AppConfig cfg)
         {
             _cfg = cfg;
-            _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+            _http = new HttpClient(BuildHandler()) { Timeout = TimeSpan.FromSeconds(30) };
             _deviceSecret = DeviceAuth.LoadDeviceSecret();
             LoadClientId();
             Directory.CreateDirectory(PendingResultsDir); // 确保目录存在
+        }
+
+        /// <summary>
+        /// 构造 HttpClientHandler（最终形态·一：mTLS 客户端证书第二因子）。
+        /// 仅当存在客户端证书(.pfx)时才附加；否则行为与旧版完全一致，不砖化。
+        /// [server] tls_verify=off（仅测试）时关闭服务端证书校验，容忍自签 nginx 证书。
+        /// </summary>
+        private HttpClientHandler BuildHandler()
+        {
+            var handler = new HttpClientHandler();
+            string certPath = ResolveClientCertPath();
+            if (!string.IsNullOrEmpty(certPath) && File.Exists(certPath))
+            {
+                try
+                {
+                    var cert = new X509Certificate2(certPath, "", X509KeyStorageFlags.PersistKeySet);
+                    handler.ClientCertificates.Add(cert);
+                    Logger.Info($"mTLS：已加载客户端证书 {certPath} (Subject={cert.Subject})");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"mTLS：客户端证书加载失败，将不使用客户端证书: {ex.Message}");
+                }
+            }
+            if (_cfg.TlsVerifyOff)
+            {
+                handler.ServerCertificateCustomValidationCallback =
+                    (sender, cert, chain, sslPolicyErrors) => true;
+                Logger.Warn("mTLS：tls_verify=off，已关闭服务端证书校验（仅测试用，生产请勿开启）");
+            }
+            return handler;
+        }
+
+        /// <summary>
+        /// 解析客户端证书路径：config [server] client_cert_path 优先；否则默认 CommonAppData/ITAsset4/agent.pfx。
+        /// 文件不存在则返回空（不附加证书）。
+        /// </summary>
+        private string ResolveClientCertPath()
+        {
+            string fromCfg = (_cfg.ClientCertPath ?? "").Trim();
+            if (!string.IsNullOrEmpty(fromCfg))
+                return fromCfg;
+            string def = Path.Combine(_cfg.BaseDir, "agent.pfx");
+            return File.Exists(def) ? def : "";
         }
 
         private void LoadClientId()
@@ -201,6 +247,8 @@ namespace ITAsset4.Common
                     message       = result.message,
                     reboot_action = result.reboot_action,
                     deferred      = result.deferred,
+                    executor_version = result.executor_version,
+                    verify_snapshot  = result.verify_snapshot,
                 };
                 using (var req = new HttpRequestMessage(HttpMethod.Post,
                     $"{_cfg.ServerUrl}/api/tasks/{targetId}/result")
@@ -238,6 +286,8 @@ namespace ITAsset4.Common
                     message     = result.message,
                     reboot_action = result.reboot_action,
                     deferred    = result.deferred,
+                    executor_version = result.executor_version,
+                    verify_snapshot  = result.verify_snapshot,
                     saved_at    = DateTime.Now,
                 };
                 string json = JsonConvert.SerializeObject(pending);
@@ -294,6 +344,8 @@ namespace ITAsset4.Common
                             message      = pending.message,
                             reboot_action = pending.reboot_action,
                             deferred     = pending.deferred,
+                            executor_version = pending.executor_version,
+                            verify_snapshot  = pending.verify_snapshot,
                         };
                         
                         await ReportResultDirectAsync(pending.target_id, result, pending.serial);
@@ -322,6 +374,8 @@ namespace ITAsset4.Common
                 message       = result.message,
                 reboot_action = result.reboot_action,
                 deferred      = result.deferred,
+                executor_version = result.executor_version,
+                verify_snapshot  = result.verify_snapshot,
             };
             using (var req = new HttpRequestMessage(HttpMethod.Post,
                 $"{_cfg.ServerUrl}/api/tasks/{targetId}/result")
@@ -403,6 +457,68 @@ namespace ITAsset4.Common
         }
 
         public void Dispose() => _http.Dispose();
+
+        // ── 客户端自更新 ──────────────────────────────────────────
+        public class ClientUpdateInfo
+        {
+            public bool   available { get; set; }
+            public string version   { get; set; } = "";
+            public string url       { get; set; } = "";
+            public string hash      { get; set; } = "";   // SHA256 hex 小写
+            public int?   size      { get; set; }
+            public bool   mandatory { get; set; }
+            public string notes     { get; set; } = "";
+        }
+
+        /// <summary>
+        /// 查询服务端是否有新版本客户端（GET /api/client/update）
+        /// </summary>
+        public async Task<ClientUpdateInfo> GetClientUpdateAsync(string serial)
+        {
+            if (_deviceSecret == null) return new ClientUpdateInfo();
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get,
+                    $"{_cfg.ServerUrl}/api/client/update");
+                AddAgentAuthHeaders(req, serial);
+                var resp = await _http.SendAsync(req);
+                resp.EnsureSuccessStatusCode();
+                string json = await resp.Content.ReadAsStringAsync();
+                var info = FromJson<ClientUpdateInfo>(json);
+                return info ?? new ClientUpdateInfo();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"查询更新失败: {ex.Message}");
+                return new ClientUpdateInfo();
+            }
+        }
+
+        /// <summary>
+        /// 下载文件到本地（流式写入），用于更新包
+        /// </summary>
+        public async Task<bool> DownloadFileAsync(string url, string destPath, string serial)
+        {
+            if (_deviceSecret == null) return false;
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                AddAgentAuthHeaders(req, serial);
+                using var resp = await _http.SendAsync(req,
+                    System.Net.Http.HttpCompletionOption.ResponseHeadersRead);
+                resp.EnsureSuccessStatusCode();
+                using var fs = new FileStream(destPath, FileMode.Create,
+                    FileAccess.Write, FileShare.None, 81920, false);
+                using var rs = await resp.Content.ReadAsStreamAsync();
+                await rs.CopyToAsync(fs);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"下载文件失败 [{url}]: {ex.Message}");
+                return false;
+            }
+        }
     }
 
     // 🔒 问题16 修复：持久化的未上报结果模型
@@ -415,6 +531,8 @@ namespace ITAsset4.Common
         public string message { get; set; } = default!;
         public string reboot_action { get; set; } = default!;
         public bool deferred { get; set; }
+        public string executor_version { get; set; } = default!;
+        public object verify_snapshot { get; set; } = default!;
         public DateTime saved_at { get; set; }
     }
 

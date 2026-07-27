@@ -6,38 +6,30 @@ namespace ITAsset4.Tray
 {
     /// <summary>
     /// Tray 应用上下文：不显示托盘图标，纯后台运行。
-    ///  用 TCP localhost 替代 Named Pipes
-    ///   - TcpScreenServer :15900（截图+弹窗）
-    ///   - TcpInputServer  :15901（鼠标输入）
-    /// 无 Session 依赖，端口固定，Service 通过 127.0.0.1 连接
     /// 
-    /// v6.0: 支持 TCP 认证（接收 authToken 并传递给 Server）
+    /// v7.0: 使用命名管道替代 TCP localhost
+    ///   - PipeScreenServer: \\.\pipe\ITAsset4_{sessionId}_Screen（截图+弹窗）
+    ///   - PipeInputServer:  \\.\pipe\ITAsset4_{sessionId}_Input（鼠标输入）
+    /// 
+    /// 命名管道是 per-session 的，无需端口冲突处理和会话看守线程。
     /// </summary>
     public class TrayApplicationContext : ApplicationContext
     {
-        private readonly TcpScreenServer _screenServer;
-        private readonly TcpInputServer _inputServer;
+        private readonly PipeScreenServer _screenServer;
+        private readonly PipeInputServer _inputServer;
 
-        // v6.0: TCP 认证 Token
-        private readonly string _authToken;
-
-        /// <summary>
-        /// v6.0: 构造函数接受 authToken
-        /// </summary>
-        public TrayApplicationContext(string authToken = null)
+        public TrayApplicationContext()
         {
-            _authToken = authToken;
-
             //  Start dedicated input worker BEFORE servers
             PipeServer.StartInputWorker();
 
-            _screenServer = new TcpScreenServer(_authToken);  // v6.0: 传入 authToken
+            _screenServer = new PipeScreenServer();
             _screenServer.Start();
 
-            _inputServer = new TcpInputServer(_authToken);    // v6.0: 传入 authToken
+            _inputServer = new PipeInputServer();
             _inputServer.Start();
 
-            Logger.Info($"Tray 应用已启动 (TCP Auth: {(!string.IsNullOrEmpty(_authToken) ? "enabled" : "disabled")})");
+            Logger.Info("Tray 应用已启动（命名管道模式）");
         }
 
         protected override void ExitThreadCore()

@@ -4,20 +4,18 @@ using System.ServiceProcess;
 using System.Threading;
 using System.Threading.Tasks;
 using ITAsset4.Common;
-using Newtonsoft.Json.Linq;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace ITAsset4.Service
 {
     /// <summary>
     /// Windows Service 主体（.NET Framework 4.8 ServiceBase）
     ///   - OnStart 线程启动增加 try/catch，防止 Thread.Start 崩溃导致 SCM 异常
-    ///   - WS fire-and-forget ConnectAsync 增加 ContinueWith 异常处
     ///   - OnStop/OnShutdown 用 RequestAdditionalTime 向 SCM 申报超时，避免"停止失败"
-    ///   - 停止等待从 8s 延长为 15s，与 RemoteScreen/TcpScreenClient 最长超时对齐
-    ///   - 主循环 Task.Delay 缩短为 30s 并监听 SessionManager 触发信号，解决 Tray 启动延迟最长 1 分钟问题
     ///   - SessionManager 新增 OnTrayNeeded 事件，用户登录时立即通知主循环
     /// 
-    /// v6.0: 支持 TCP 认证（生成 token 并传递给 Tray 和 Client）
+    /// v7.0: 使用命名管道替代 TCP（per-session，无需 auth token/端口管理）
     /// </summary>
     public class AgentService : ServiceBase
     {
@@ -28,19 +26,20 @@ namespace ITAsset4.Service
         private Thread _workerThread = default!;
         private readonly ManualResetEventSlim _stopped = new ManualResetEventSlim(false);
 
+        // ── DI ──
+        private readonly IServiceProvider _services;
+        private readonly ILogger<AgentService> _logger;
+
         private AppConfig        _cfg = default!;
         private ApiClient        _api = default!;
         private SystemCollector  _collector = default!;
         private TaskExecutor     _executor = default!;
         private WsClient         _wsClient = default!;
         private RemoteScreen     _remoteScreen = default!;
-        private TcpScreenClient _screenClient = default!;   // v6.0: TCP 认证 Client
-        private TcpInputClient   _inputClient = default!;
-        private string           _expectedSessionToken = default!;  // 远程桌面一次性 token，viewer 连接时验证
+        private PipeScreenClient _screenClient = default!;
+        private PipeInputClient   _inputClient = default!;
         private SessionManager   _sessionMgr = default!;
-        
-        // v6.0: TCP 认证 Token
-        private string           _tcpAuthToken = default!;
+        private UpdateChecker     _updateChecker = default!;
 
         // 推迟中的任务：target_id → 到期时间
         private readonly Dictionary<int, DateTime> _deferred = new Dictionary<int, DateTime>();
@@ -56,12 +55,15 @@ namespace ITAsset4.Service
         //  停止超时常量，统一管理
         private const int STOP_WAIT_MS = 15_000;
 
-        public AgentService()
+        public AgentService(IServiceProvider services)
         {
             ServiceName         = "ITAsset4Agent";
             CanStop             = true;
             CanPauseAndContinue = false;
             AutoLog             = true;
+
+            _services = services;
+            _logger   = services.GetRequiredService<ILogger<AgentService>>();
         }
 
         // ── ServiceBase 生命周期 ──────────────────────────────────────────────
@@ -126,18 +128,8 @@ namespace ITAsset4.Service
             {
                 Logger.Info("==== ITAsset4 Agent v1.0.0 启动 ====");
 
-                string cfgPath = System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                    "ITAsset4", "config.ini");
-
-                if (!System.IO.File.Exists(cfgPath))
-                {
-                    AppConfig.WriteDefault(cfgPath);
-                    Logger.Info($"已生成默认配置: {cfgPath}");
-                }
-
-                _cfg       = AppConfig.Load(cfgPath);
-                _api       = new ApiClient(_cfg);
+                _cfg = _services.GetRequiredService<AppConfig>();
+                _api = _services.GetRequiredService<ApiClient>();
                 _collector = new SystemCollector();
                 // v6.1: 传入 UI 委托（用于 interactive/deferred/reboot 弹窗）
                 // _screenClient 可能在 WS remote_start 之后才创建，所以用延迟委托
@@ -146,15 +138,11 @@ namespace ITAsset4.Service
                     _cfg,
                     uiSender: req => SendToTrayAsync(req),
                     auditReporter: (path, args, pid, exitCode, at) => ReportAuditSafeAsync(path, args, pid, exitCode, at));
-
-                // v6.0: 生成 TCP 认证 Token
-                _tcpAuthToken = Guid.NewGuid().ToString("N");
-                Logger.Info($"[TCP Auth] Token 已生成: {_tcpAuthToken.Substring(0, Math.Min(8, _tcpAuthToken.Length))}...");
+                _updateChecker = new UpdateChecker(_cfg, _api);
 
                 //  启动 Session 管理器（用户登录时自动拉起 Tray）
                 // 订阅事件，用户登录时立即唤醒主循环检查 Tray，不再等最长 1 分钟
                 _sessionMgr = new SessionManager();
-                _sessionMgr.SetAuthToken(_tcpAuthToken);  // v6.0: 设置 TCP 认证 Token
                 _sessionMgr.OnTrayNeeded += () =>
                 {
                     Logger.Info("[SessionMgr] 收到 OnTrayNeeded 信号，唤醒主循环立即检查 Tray");
@@ -180,9 +168,9 @@ namespace ITAsset4.Service
 
                 if (ct.IsCancellationRequested) return;
 
-                // ── 初始化 TcpInputClient（持久输入连接）────────────────────
-                _inputClient = new TcpInputClient(_tcpAuthToken);  // v6.0: 传入认证 Token
-                Logger.Info("TcpInputClient 已创建");
+                // ── 初始化 PipeInputClient（持久输入连接）────────────────────
+                _inputClient = new PipeInputClient();
+                Logger.Info("PipeInputClient 已创建");
 
                 // ── 注册成功，先建 WS（远程桌面立即可用），再上报 ─────
                 {
@@ -205,38 +193,35 @@ namespace ITAsset4.Service
                             {
                                 if (msgType == "remote_start")
                                 {
-                                    //  安全改进：只存储 session_token，不立即启动截图
-                                    // viewer 连接后发 viewer_connected + token，Agent 验证通过才启动
-                                    var token = (string)JObject.Parse(rawJson)["session_token"];
-                                    _expectedSessionToken = token;
-                                    Logger.Info($"[Remote] received remote_start, token verified (not logged)");  // 🔒 修复问题27：不再记录 token
-                                    
-                                    // v6.0: 创建 RemoteScreen 时传入认证 Token
-                                    _screenClient = new TcpScreenClient(_tcpAuthToken);
+                                    Logger.Info("[Remote] received remote_start, preparing pipe connection");
+
+                                    _screenClient = new PipeScreenClient();
                                     if (_remoteScreen == null)
                                         _remoteScreen = new RemoteScreen(_wsClient, req => _screenClient.SendAsync(req));
                                 }
                                 else if (msgType == "viewer_connected")
                                 {
-                                    // viewer 连接确认：验证 session_token 一致后才启动截图
-                                    var token = (string)JObject.Parse(rawJson)["session_token"];
-                                    if (!string.IsNullOrEmpty(_expectedSessionToken)
-                                        && _expectedSessionToken == token)
+                                    // 命名管道 per-session，无需 token 验证。
+                                    // viewer 已连接，启动远程桌面截图。
+                                    Logger.Info("[Remote] viewer_connected，启动远程桌面");
+                                    if (_remoteScreen != null && !_remoteScreen.IsRunning)
                                     {
-                                        Logger.Info("[Remote] viewer_connected token 验证通过，启动远程桌面");
-                                        if (!_remoteScreen.IsRunning)
-                                            _remoteScreen.Start();
-                                    }
-                                    else
-                                    {
-                                        Logger.Warn($"[Remote] viewer_connected token 不匹配! (details not logged)");  // 🔒 修复问题27：不再记录 token
+                                        // 连接 Pipe 到 Tray
+                                        int sid = _sessionMgr.GetActiveSessionId();
+                                        if (sid > 0)
+                                        {
+                                            await _screenClient.ConnectAsync(sid);
+                                            await _inputClient.ConnectAsync(sid);
+                                        }
+                                        _remoteScreen.Start();
                                     }
                                 }
                                 else if (msgType == "remote_stop")
                                 {
                                     Logger.Info("[Remote] received remote_stop command");
-                                    _expectedSessionToken = null;
                                     _remoteScreen?.Stop();
+                                    _screenClient?.Disconnect();
+                                    _inputClient?.Disconnect();
                                 }
                                 else if (msgType == "remote_input")
                                 {
@@ -259,7 +244,7 @@ namespace ITAsset4.Service
                                         // 通知 RemoteScreen 升帧率
                                         _remoteScreen?.NotifyInput();
 
-                                        // 走专用输入 TcpClient（持久连接，不阻塞截图）
+                                        // 走专用输入 PipeClient（持久连接，不阻塞截图）
                                         await _inputClient.SendInputAsync(pr);
                                     }
                                 }
@@ -328,12 +313,13 @@ namespace ITAsset4.Service
             finally
             {
                 //  统一清理顺序
-                // 1. 先停截图循环（避免它继续占用 TcpScreenClient）
-                // 2. 再停输入客户端
+                // 1. 先停截图循环（避免它继续占用 PipeScreenClient）
+                // 2. 再关屏幕客户端和输入客户端
                 // 3. 再停 WS（截图/输入都停了才关 WS）
                 // 4. 最后停 SessionMgr、Api
                 Logger.Info("==== ITAsset4 Agent 开始清理 ====");
                 try { _remoteScreen?.Stop(); } catch (Exception ex) { Logger.Warn($"RemoteScreen Stop 异常: {ex.Message}"); }
+                try { _screenClient?.Dispose(); } catch (Exception ex) { Logger.Warn($"ScreenClient Dispose 异常: {ex.Message}"); }
                 try { _inputClient?.Dispose(); } catch (Exception ex) { Logger.Warn($"InputClient Dispose 异常: {ex.Message}"); }
                 try { PipeHelper.CancelAll(); } catch { }
                 try { _sessionMgr?.Dispose(); } catch (Exception ex) { Logger.Warn($"SessionMgr Dispose 异常: {ex.Message}"); }
@@ -351,20 +337,20 @@ namespace ITAsset4.Service
         }
 
         /// <summary>
-        /// 延迟 UI 请求委托：通过 TcpScreenClient 发送 ASK_INSTALL/ASK_REBOOT 到 Tray
+        /// 延迟 UI 请求委托：通过 PipeScreenClient 发送 ASK_INSTALL/ASK_REBOOT 到 Tray
         /// _screenClient 可能在 remote_start 之后才创建，所以需要动态检查
         /// </summary>
         private async Task<PipeResponse> SendToTrayAsync(PipeRequest req)
         {
-            // 优先走 TCP (TcpScreenClient)，如果还没初始化则降级到 Pipe
+            // 优先走 Pipe Screen（如果已初始化）
             if (_screenClient != null)
             {
                 var resp = await _screenClient.SendAsync(req);
                 if (resp != null) return resp;
             }
 
-            // TCP 不可用 → 尝试 Named Pipe（兼容 Tray 已启动但 WS 未连接的场景）
-            Logger.Info($"[UI] TCP ScreenClient 不可用，尝试 Pipe: {req.type}");
+            // Pipe Screen 不可用 → 尝试 Named Pipe（兼容 Tray 已启动但 WS 未连接的场景）
+            Logger.Info($"[UI] Pipe ScreenClient 不可用，尝试 Pipe: {req.type}");
             return await PipeHelper.SendAsync(req);
         }
 
@@ -432,6 +418,10 @@ namespace ITAsset4.Service
                     }
                     
                     await FetchAndRunTasksAsync(info.serial, ct);
+
+                    // 客户端自更新检查（每 10 分钟随任务轮询一起）
+                    try { await _updateChecker.CheckAndApplyAsync(info.serial, ct); }
+                    catch (Exception ex) { Logger.Error($"更新检查异常: {ex.Message}"); }
                 }
                 else
                 {
@@ -524,6 +514,8 @@ namespace ITAsset4.Service
                 Logger.Error($"[任务 {task.target_id}] 执行异常: {ex.Message}");
                 result = new TaskResult { success = false, message = ex.Message };
             }
+            // ── 附带 Agent 版本号 ──
+            result.executor_version = ClientVersion.Current;
 
             if (result.deferred)
             {

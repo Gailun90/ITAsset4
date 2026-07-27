@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,7 +11,6 @@ namespace ITAsset4.Service
     /// TcpScreenClient — 通过 TCP localhost:15900 请求截图/弹窗
     /// 短连接模式，方法签名与 PipeHelper.SendAsync 完全兼容
     /// 
-    /// v6.0: 支持 TCP 认证（连接后先发送 AUTH &lt;token&gt;）
     /// </summary>
     public class TcpScreenClient : IDisposable
     {
@@ -19,19 +18,12 @@ namespace ITAsset4.Service
         private const int CONNECT_TIMEOUT_MS = 3000;
         private const int ASK_TIMEOUT_MS = 300_000;
 
-        // v6.0: TCP 认证 Token
-        private readonly string _authToken;
-
-        /// <summary>
-        /// v6.0: 创建 TcpScreenClient 实例（支持认证）
-        /// </summary>
-        public TcpScreenClient(string authToken = null)
+        public TcpScreenClient()
         {
-            _authToken = authToken;
         }
 
         /// <summary>
-        /// v6.0: 修改为实例方法，支持认证
+        /// 发送请求并返回响应
         /// </summary>
         public async Task<PipeResponse> SendAsync(PipeRequest request)
         {
@@ -58,23 +50,6 @@ namespace ITAsset4.Service
 
                     var stream = client.GetStream();
                     
-                    // v6.0: 认证（如果配置了 token）
-                    if (!string.IsNullOrEmpty(_authToken))
-                    {
-                        string authMsg = $"AUTH {_authToken}\n";
-                        byte[] authBytes = System.Text.Encoding.UTF8.GetBytes(authMsg);
-                        await stream.WriteAsync(authBytes, 0, authBytes.Length, cts.Token);
-                        
-                        // 读取认证响应
-                        string authResp = await TcpFrameHelper.ReadFrameAsync(stream, cts.Token);
-                        if (string.IsNullOrEmpty(authResp) || !authResp.StartsWith("OK"))
-                        {
-                            Logger.Warn($"[TcpScreen] 认证失败: {authResp}");
-                            return null;
-                        }
-                        Logger.Info("[TcpScreen] TCP 认证成功");
-                    }
-
                     string reqJson = JsonConvert.SerializeObject(request);
                     await TcpFrameHelper.WriteFrameAsync(stream, reqJson, cts.Token);
 

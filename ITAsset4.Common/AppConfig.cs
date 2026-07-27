@@ -61,6 +61,25 @@ namespace ITAsset4.Common
         public string ServerUrl => Get("server", "url", "").TrimEnd('/');
 
         /// <summary>
+        /// mTLS 客户端证书(.pfx)路径（最终形态·一 第二因子）。
+        /// 为空时使用默认位置 CommonAppData/ITAsset4/agent.pfx。文件不存在则不启用客户端证书。
+        /// </summary>
+        public string ClientCertPath => Get("server", "client_cert_path", "").Trim();
+
+        /// <summary>
+        /// 是否关闭服务端证书校验（仅测试用）。config [server] tls_verify=off 时为真。
+        /// 生产环境应保持 on（默认），由受信 CA 校验 nginx 服务端证书。
+        /// </summary>
+        public bool TlsVerifyOff
+        {
+            get
+            {
+                string v = Get("server", "tls_verify", "on").Trim().ToLower();
+                return v == "off";
+            }
+        }
+
+        /// <summary>
         /// 初始注册 Token：
         ///   优先读取 config.ini [server] initial_token；
         ///   若未配置则抛出异常（不再使用硬编码默认值）。

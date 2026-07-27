@@ -75,6 +75,12 @@ namespace ITAsset4.Tray
                 return tcs.Task;
             }
 
+            if (req.type == "screen_state")
+            {
+                tcs.TrySetResult(new PipeResponse { result = GetScreenState() });
+                return tcs.Task;
+            }
+
             if (req.type == "remote_input")
             {
                 string result = HandleMouseInputPublic(req);
@@ -414,6 +420,32 @@ namespace ITAsset4.Tray
             _lastInputOk == DateTime.MinValue
                 ? "无输入记录"
                 : $"最后成功: {_lastInputOk:HH:mm:ss.fff}, 距今 {(DateTime.Now - _lastInputOk).TotalSeconds:F0}s";
+
+        /// <summary>
+        /// 检测当前屏幕状态：锁屏/登录/UAC 安全桌面(Winlogon) / 屏保 / 正常。
+        /// 供远程桌面在连接时及时告知前端操作者。
+        /// </summary>
+        public static string GetScreenState()
+        {
+            try
+            {
+                IntPtr h = OpenInputDesktop(0, false, DESKTOP_READOBJECTS);
+                if (h == IntPtr.Zero)
+                    return ScreenStateMsg.NoDesktop;
+                string name = GetDesktopName(h);
+                CloseDesktop(h);
+                if (name == "Winlogon")
+                    return ScreenStateMsg.Locked;       // 锁屏 / 登录 / UAC 安全桌面
+                if (name.IndexOf("Screen-saver", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return ScreenStateMsg.ScreenSaver;
+                return ScreenStateMsg.Active;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[ScreenState] 检测异常: {ex.Message}");
+                return ScreenStateMsg.Active;
+            }
+        }
 
         // ── 核心 SendInput 实现 ──
         private static string SendMouseInputInternal(PipeRequest req)

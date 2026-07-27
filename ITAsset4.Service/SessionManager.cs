@@ -31,7 +31,6 @@ namespace ITAsset4.Service
         private Thread _watchThread = default!;
 
         // v6.0: TCP 认证 Token，启动 Tray 时通过命令行参数传递
-        private string _tcpAuthToken = default!;
 
         public SessionManager()
         {
@@ -46,16 +45,9 @@ namespace ITAsset4.Service
         }
 
         /// <summary>
-        /// v6.0: 设置 TCP 认证 Token（由 AgentWorker 在启动前调用）
+        /// 获取当前活动用户 Session ID（供 AgentWorker 连接 Pipe 使用）
         /// </summary>
-        public void SetAuthToken(string token)
-        {
-            lock (_lock)
-            {
-                _tcpAuthToken = token;
-            }
-            Logger.Info($"[SessionMgr] TCP Auth Token 已设置（不记录到日志）");  // 🔒 修复问题27：不再记录 token 任何部分
-        }
+        public int GetActiveSessionId() => GetActiveUserSessionId();
 
         /// <summary>
         /// 启动：立即检查一次，再启动后台线程监听 WTS 事件
@@ -94,12 +86,8 @@ namespace ITAsset4.Service
                 return;
             }
 
-            // v6.0: 获取 auth token 用于传递给 Tray
-            string authToken;
-            lock (_lock) { authToken = _tcpAuthToken; }
-
             Logger.Info($"[SessionMgr] Tray 未运行（Session={sid}），准备启动...");
-            bool launched = LaunchProcessInSession(sid, _trayExePath, authToken);
+            bool launched = LaunchProcessInSession(sid, _trayExePath);
             if (launched)
             {
                 lock (_lock) { _lastLaunchedSession = sid; _lastLaunchTime = DateTime.Now; }
@@ -182,7 +170,7 @@ namespace ITAsset4.Service
         /// <summary>
         /// v6.0: 支持传入 authToken，通过命令行参数 --auth-token 传递给 Tray
         /// </summary>
-        public static bool LaunchProcessInSession(int sessionId, string exePath, string authToken = "")
+        public static bool LaunchProcessInSession(int sessionId, string exePath)
         {
             IntPtr hUserToken = IntPtr.Zero;
             IntPtr hDupToken  = IntPtr.Zero;
@@ -218,14 +206,7 @@ namespace ITAsset4.Service
                 uint flags = NORMAL_PRIORITY_CLASS;
                 if (hEnvBlock != IntPtr.Zero) flags |= CREATE_UNICODE_ENVIRONMENT;
 
-                // v6.0: 构建命令行，包含 auth token
-                string args = "";
-                if (!string.IsNullOrEmpty(authToken))
-                {
-                    args = $"--auth-token {authToken}";
-                }
-
-                string cmdLine = $"\"{exePath}\" {args}".Trim();
+                string cmdLine = $"\"{exePath}\"";
                 bool ok = CreateProcessAsUser(hDupToken, null, cmdLine,
                     IntPtr.Zero, IntPtr.Zero, false,
                     flags, hEnvBlock, null, ref si, out pi);

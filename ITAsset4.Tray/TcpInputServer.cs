@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -20,6 +20,7 @@ namespace ITAsset4.Tray
     {
         private TcpListener _listener = default!;
         private CancellationTokenSource _cts = default!;
+        private readonly Action _onFatalBind;
         private const int PORT = 15901;
 
         // v5.1: 连接状态追踪
@@ -28,15 +29,9 @@ namespace ITAsset4.Tray
         private static DateTime _lastInputTime = DateTime.MinValue;
         private static readonly object _statusLock = new object();
 
-        // v6.0: TCP 认证 Token
-        private readonly string _authToken;
-
-        /// <summary>
-        /// v6.0: 创建 TcpInputServer（支持认证）
-        /// </summary>
-        public TcpInputServer(string authToken = null)
+        public TcpInputServer(Action onFatalBind = null)
         {
-            _authToken = authToken;
+            _onFatalBind = onFatalBind;
         }
 
         public void Start()
@@ -45,7 +40,7 @@ namespace ITAsset4.Tray
             Task.Run(() => AcceptLoop(_cts.Token));
             // v5.1: 启动 60s 自检
             Task.Run(() => SelfCheckLoop(_cts.Token));
-            Logger.Info($"[TcpInput] 已启动 127.0.0.1:{PORT} TraySession={System.Diagnostics.Process.GetCurrentProcess().SessionId} (Auth: {(!string.IsNullOrEmpty(_authToken) ? "enabled" : "disabled")})");
+            Logger.Info($"[TcpInput] 已启动 127.0.0.1:{PORT} TraySession={System.Diagnostics.Process.GetCurrentProcess().SessionId}");
         }
 
         public void Stop()
@@ -78,7 +73,25 @@ namespace ITAsset4.Tray
         {
             _listener = new TcpListener(IPAddress.Loopback, PORT);
             _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            _listener.Start();
+
+            // 绑定失败重试：多用户场景下，另一 Session 的 Tray 可能暂占同一端口
+            int retries = 20;
+            bool bound = false;
+            while (retries-- > 0 && !ct.IsCancellationRequested)
+            {
+                try { _listener.Start(); bound = true; break; }
+                catch (SocketException ex)
+                {
+                    Logger.Warn($"[TcpInput] 绑定 127.0.0.1:{PORT} 失败，1s 后重试: {ex.Message}");
+                    try { await Task.Delay(1000, ct); } catch { break; }
+                }
+            }
+            if (!bound)
+            {
+                Logger.Error($"[TcpInput] 端口 {PORT} 持续被占用，Tray 退出以释放冲突");
+                _onFatalBind?.Invoke();
+                return;
+            }
 
             while (!ct.IsCancellationRequested)
             {
@@ -116,39 +129,6 @@ namespace ITAsset4.Tray
             {
                 var stream = client.GetStream();
 
-                // v6.0: TCP 认证（如果配置了 token）
-                if (!string.IsNullOrEmpty(_authToken))
-                {
-                    try
-                    {
-                        // 读取认证消息（带超时）
-                        using var authCts = new CancellationTokenSource(5000); // 5秒超时
-                        string authLine = await TcpFrameHelper.ReadFrameAsync(stream, authCts.Token);
-
-                        if (string.IsNullOrEmpty(authLine) || authLine != $"AUTH {_authToken}")
-                        {
-                            Logger.Warn($"[TcpInput] 认证失败: {authLine?.Substring(0, Math.Min(20, authLine?.Length ?? 0))}...");
-                            // 发送认证失败响应
-                            try { await TcpFrameHelper.WriteFrameAsync(stream, "ERROR invalid auth", CancellationToken.None); } catch { }
-                            return;
-                        }
-
-                        // 认证成功，发送 OK
-                        await TcpFrameHelper.WriteFrameAsync(stream, "OK", CancellationToken.None);
-                        Logger.Info("[TcpInput] TCP 认证成功");
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        Logger.Warn("[TcpInput] 认证超时，断开连接");
-                        return;
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warn($"[TcpInput] 认证异常: {ex.Message}");
-                        return;
-                    }
-                }
-
                 while (client.Connected && !ct.IsCancellationRequested)
                 {
                     try
@@ -164,7 +144,6 @@ namespace ITAsset4.Tray
                             localLastInput = DateTime.Now;
                             lock (_statusLock) { _lastInputTime = localLastInput; }
 
-                            // v5.1: 非 move 事件记录（move 由 SendMouseInput 节流）
                             if (pr.event_type != "move")
                                 Logger.Info($"[TcpInput] #{handledCount} {pr.event_type}({pr.button}) → {result}");
                         }
