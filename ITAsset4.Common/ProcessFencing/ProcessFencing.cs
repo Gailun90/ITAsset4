@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace ITAsset4.Common.ProcessFencing
 {
@@ -21,7 +21,11 @@ namespace ITAsset4.Common.ProcessFencing
         {
             // 真实实现（如通过 Job Object 限制子进程树、提升自身优先级等）
             // 应在恢复完整源码后回填。当前为空实现，不影响编译与现有行为。
-            IsFenced = true;
+            //
+            // 修复：此前这里无条件把 IsFenced 设为 true，等于在什么都没做的情况下
+            // 谎报围栏已生效——一旦以后有代码依据 IsFenced 判断可以放心做某个操作，
+            // 会拿到一个假的安全信号。在真实实现补上之前，如实保持 false。
+            IsFenced = false;
         }
     }
 }
