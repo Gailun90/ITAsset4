@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -77,6 +77,8 @@ namespace ITAsset4.Common
             long startPos = File.Exists(dest) ? new FileInfo(dest).Length : 0;
             Logger.Info($"[下载] 开始: {safeName} (offset={startPos})");
 
+            long? contentLength = null;
+
             using (var http = new HttpClient { Timeout = TimeSpan.FromHours(2) })
             {
                 string ts  = DeviceAuth.NowTimestamp();
@@ -96,25 +98,49 @@ namespace ITAsset4.Common
                     resp.Dispose();
                     resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
                     resp.EnsureSuccessStatusCode();
+                    contentLength = resp.Content.Headers.ContentLength;
                     await SaveStreamAsync(resp, dest, 0, bandwidthLimitKb, ct);
                 }
                 else
                 {
                     resp.EnsureSuccessStatusCode();
+                    contentLength = resp.Content.Headers.ContentLength;
                     await SaveStreamAsync(resp, dest, startPos, bandwidthLimitKb, ct);
                 }
             }
 
-            if (!string.IsNullOrEmpty(expectedHash))
+            // 修复：此前完全没有把实际写入的字节数和响应头 Content-Length 对比过，
+            // 网络连接中途断开时 ReadAsync 会直接返回 0（不一定抛异常），
+            // 会被当成"读到文件末尾=下载完成"，截断的文件就这么被当成完整文件放行。
+            if (contentLength.HasValue)
             {
-                string actual = ComputeHash(dest);
-                if (!string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase))
+                long actualSize = new FileInfo(dest).Length;
+                long expectedSize = startPos + contentLength.Value;
+                if (actualSize != expectedSize)
                 {
                     File.Delete(dest);
-                    throw new Exception($"SHA256 不匹配: 期望={expectedHash}, 实际={actual}");
+                    throw new Exception($"下载不完整: 期望大小={expectedSize}, 实际大小={actualSize}（网络可能中途断开）");
                 }
-                Logger.Info($"[下载] SHA256 校验通过: {safeName}");
             }
+
+            // 修复：此前完整性校验完全依赖 expectedHash 是否非空——一旦服务端给的哈希是空的
+            // （比如包注册流程哪次哈希计算失败留了空值），前面的大小校验之外就再没有任何
+            // 手段确认文件内容正确，之前的代码会直接放行去执行安装。
+            // 现在即使没有 hash，也强制拒绝执行，而不是静默信任。
+            if (string.IsNullOrEmpty(expectedHash))
+            {
+                Logger.Warn($"[下载] {safeName} 服务端未提供 SHA256，无法校验内容完整性，拒绝执行");
+                File.Delete(dest);
+                throw new Exception($"服务端未提供安装包 {safeName} 的 SHA256，出于可靠性考虑拒绝执行未经校验的安装包（请检查包注册流程是否漏算了哈希）");
+            }
+
+            string actual = ComputeHash(dest);
+            if (!string.Equals(actual, expectedHash, StringComparison.OrdinalIgnoreCase))
+            {
+                File.Delete(dest);
+                throw new Exception($"SHA256 不匹配: 期望={expectedHash}, 实际={actual}");
+            }
+            Logger.Info($"[下载] SHA256 校验通过: {safeName}");
 
             return dest;
         }
