@@ -410,20 +410,44 @@ namespace ITAsset4.Service
             bool allOk = true;
             foreach (var op in ops)
             {
+                // 打开“可写 + 拥有型”的根键：
+                //  - HKLM 用 RegistryKey.OpenBaseKey(...) 拿到自带写权限、且由本代码拥有的键，
+                //    既能 CreateSubKey(writable:true) 成功，又能安全 Dispose（不会触碰共享静态基键）；
+                //    旧代码直接用静态只读的 Registry.LocalMachine，在其上 CreateSubKey 会因父键只读
+                //    抛 UnauthorizedAccessException，导致所有 HKLM 的 SET/DELETE 静默失败。
+                //  - HKCU 仍走 OpenTargetHkcu；若它回退到静态 Registry.CurrentUser，则不释放（避免触碰共享基键）。
+                RegistryKey root;
+                bool ownsRoot;
+                if (op.root == "HKCU")
+                {
+                    root = OpenTargetHkcu(task.run_as);
+                    ownsRoot = root != Registry.CurrentUser;
+                }
+                else
+                {
+                    root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+                    ownsRoot = true;
+                }
+
+                if (root == null)
+                {
+                    sb.AppendLine($"[SKIP] 无法打开根键 {op.root}");
+                    allOk = false;
+                    continue;
+                }
+
                 try
                 {
-                    RegistryKey root = op.root == "HKCU" ? OpenTargetHkcu(task.run_as) : Registry.LocalMachine;
-                    if (root == null) { sb.AppendLine($"[SKIP] 无法打开根键 {op.root}"); allOk = false; continue; }
-                    bool writableRoot = op.root != "HKCU";
-                    using (var actualRoot = writableRoot ? root : root)
-                    {
-                        sb.AppendLine("  " + ApplyRegistryOp(op, actualRoot));
-                    }
+                    sb.AppendLine("  " + ApplyRegistryOp(op, root));
                 }
                 catch (Exception ex)
                 {
                     allOk = false;
                     sb.AppendLine($"[ERROR] {op.subkey}\\{op.name}: {ex.Message}");
+                }
+                finally
+                {
+                    if (ownsRoot) root.Dispose();
                 }
             }
 
@@ -1157,10 +1181,12 @@ namespace ITAsset4.Service
 
                 Logger.Info($"[UI] ASK_INSTALL 用户响应: {resp.result}");
 
+                // 三态契约：OK=确认 / CANCEL=用户取消(取消按钮/超时/关闭) / 其它=推迟
                 if (resp.result == "OK")
                     return "OK";
-                else
-                    return "DEFERRED";
+                if (resp.result == "CANCEL")
+                    return "CANCEL";
+                return "DEFERRED";
             }
             catch (Exception ex)
             {

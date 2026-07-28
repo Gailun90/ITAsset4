@@ -23,8 +23,14 @@ namespace ITAsset4.Tray
 
             using (var dlg = new InstallConfirmForm(appName, deferHint, canDefer, isLastChance, DIALOG_TIMEOUT_SEC))
             {
+                // 三态契约：Yes=OK(立即安装) / No=DEFERRED(推迟) / 其它(Cancel/超时/关闭X)=CANCEL
                 var dr = dlg.ShowDialog();
-                return dr == DialogResult.Yes ? "OK" : "CANCEL";
+                return dr switch
+                {
+                    DialogResult.Yes => "OK",
+                    DialogResult.No  => "DEFERRED",
+                    _                 => "CANCEL",
+                };
             }
         }
 
@@ -67,7 +73,7 @@ namespace ITAsset4.Tray
             Text            = isLastChance
                 ? $"⚠️ 最后推迟机会 - {appName}"
                 : $"软件安装请求 - {FormatTime(_remainSeconds)}";
-            Size            = new System.Drawing.Size(460, 260);
+            Size            = new System.Drawing.Size(500, 260);
             StartPosition   = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox     = false;
@@ -101,7 +107,7 @@ namespace ITAsset4.Tray
             {
                 Text         = "立即安装",
                 DialogResult = DialogResult.Yes,
-                Bounds       = new System.Drawing.Rectangle(60, 190, 130, 36),
+                Bounds       = new System.Drawing.Rectangle(40, 190, 120, 36),
                 BackColor    = System.Drawing.Color.FromArgb(0, 120, 212),
                 ForeColor    = System.Drawing.Color.White,
                 FlatStyle    = FlatStyle.Flat,
@@ -109,16 +115,25 @@ namespace ITAsset4.Tray
 
             var btnDefer = new Button
             {
-                Text         = canDefer ? (isLastChance ? "⚠️ 最后一次推迟" : "推迟安装") : "关闭",
+                // 推迟：达上限时禁用，仅作展示；未达上限才是可点的“推迟安装”
+                Text         = canDefer ? (isLastChance ? "⚠️ 最后一次推迟" : "推迟安装") : "推迟(已达上限)",
                 DialogResult = DialogResult.No,
-                Bounds       = new System.Drawing.Rectangle(250, 190, 150, 36),
-
-                // Update the problematic line
+                Enabled      = canDefer,
+                Bounds       = new System.Drawing.Rectangle(185, 190, 130, 36),
                 ForeColor    = isLastChance ? System.Drawing.Color.Crimson : System.Drawing.SystemColors.ControlText,
             };
 
+            var btnCancel = new Button
+            {
+                // 取消：真正中止任务（区别于“推迟”）。超时/点右上角X 也落到 Cancel → CANCEL
+                Text         = "取消",
+                DialogResult = DialogResult.Cancel,
+                Bounds       = new System.Drawing.Rectangle(330, 190, 130, 36),
+            };
+
             AcceptButton = btnInstall;
-            Controls.AddRange(new Control[] { lbl, _lblCountdown, btnInstall, btnDefer });
+            CancelButton = btnCancel;
+            Controls.AddRange(new Control[] { lbl, _lblCountdown, btnInstall, btnDefer, btnCancel });
 
             _countdown = new System.Windows.Forms.Timer { Interval = 1000 };
             _countdown.Tick += (s, e) =>

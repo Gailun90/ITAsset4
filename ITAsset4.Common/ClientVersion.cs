@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace ITAsset4.Common
 {
@@ -12,7 +12,7 @@ namespace ITAsset4.Common
     /// </summary>
     public static class ClientVersion
     {
-        public const string Current = "1.2.8";
+        public const string Current = "1.2.9";
 
         /// <summary>
         /// 将 "1.1.0" 形式的版本号解析为可比较的 (major,minor,build) 元组。
