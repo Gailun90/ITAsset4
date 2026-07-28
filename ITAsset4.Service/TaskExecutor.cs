@@ -1,4 +1,4 @@
-using ITAsset4.Common;
+﻿using ITAsset4.Common;
 using ITAsset4.Common.Tasks;
 using ITAsset4.Service.TaskHandlers;
 using System;
@@ -29,8 +29,13 @@ namespace ITAsset4.Service
         private readonly Func<string, string, int?, int?, DateTime, Task> _auditReporter;
 
         // 黑名单：防止命令注入的特殊字符（修复 8A：原来定义但从未使用）
+        // 修复：此前把双引号也列入黑名单，导致 INSTALLDIR="C:\Program Files\XXX" 这类
+        // 路径含空格必须加引号的正常安装/卸载参数被直接拒绝执行。这里走的是
+        // Process.Start(UseShellExecute=false)，参数不经过 cmd.exe/powershell 解析，
+        // 双引号本身不构成注入风险，真正需要拦的是换行/反引号/<>|&^ 这类只有
+        // "目标本身是解释器"时才有意义的字符。
         private static readonly Regex BlacklistRegex =
-            new Regex(@"[\r\n`""<>|&^]", RegexOptions.Compiled);
+            new Regex(@"[\r\n`<>|&^]", RegexOptions.Compiled);
 
         // P0 安全：禁止重启/关机关键词黑名单（服务端+客户端两端共享规则）
         // 纵深防御：服务端已经拦过一次，但客户端作为最后防线必须独立检查
