@@ -51,6 +51,28 @@ namespace ITAsset4.Service
                 @"|\brestart\b",
                 RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        /// <summary>
+        /// 去掉脚本里的注释行/行尾注释，避免"注释里提到 reboot/restart"被 RebootBlacklist 误判为
+        /// 真实的重启命令。覆盖 PowerShell/CMD 常见的 # / REM / :: 注释写法。
+        /// </summary>
+        private static string StripComments(string commandText)
+        {
+            if (string.IsNullOrEmpty(commandText)) return commandText ?? "";
+            var lines = new List<string>();
+            foreach (var raw in commandText.Split('\n'))
+            {
+                string line = raw;
+                string trimmed = line.Trim();
+                string upper = trimmed.ToUpperInvariant();
+                if (trimmed.StartsWith("#") || upper.StartsWith("REM ") || upper == "REM" || trimmed.StartsWith("::"))
+                    continue;
+                int hashPos = line.IndexOf('#');
+                if (hashPos >= 0) line = line.Substring(0, hashPos);
+                lines.Add(line);
+            }
+            return string.Join("\n", lines);
+        }
+
         // 卸载成功的退出码
         private static readonly int[] UninstallSuccessCodes =
             { 0, 19, 3010, 1641, 1638, 1650 };
@@ -286,7 +308,7 @@ namespace ITAsset4.Service
                 File.WriteAllText(file, task.command ?? "", Encoding.UTF8);
 
                 // ── P0 安全纵深防御：客户端独立扫描重启/关机关键词 ──
-                var rebootHit = RebootBlacklist.Match(task.command ?? "");
+                var rebootHit = RebootBlacklist.Match(StripComments(task.command ?? ""));
                 if (rebootHit.Success)
                 {
                     Logger.Error($"[安全 命令任务 {task.target_id}] 命令包含禁止的重启/关机操作，拒绝执行。命中: {rebootHit.Value}");
