@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
@@ -111,7 +111,7 @@ namespace ITAsset4.Common
                 }
                 catch (Exception ex)
                 {
-                    Logger.Warn($"WS 连接失败: {ex.Message}");
+                    Logger.Warn($"WS 连接失败: {ExDetail(ex)}");
                 }
                 finally
                 {
@@ -130,6 +130,21 @@ namespace ITAsset4.Common
             }
 
             Logger.Info("WS 连接循环退出");
+        }
+
+        private static string ExDetail(Exception ex)
+        {
+            var sb = new StringBuilder();
+            sb.Append(ex.GetType().Name).Append(": ").Append(ex.Message);
+            var inner = ex.InnerException;
+            int depth = 0;
+            while (inner != null && depth < 3)
+            {
+                sb.Append(" -> ").Append(inner.GetType().Name).Append(": ").Append(inner.Message);
+                inner = inner.InnerException;
+                depth++;
+            }
+            return sb.ToString();
         }
 
         private static async Task SafeWaitAsync(Task task, TimeSpan timeout)
@@ -157,7 +172,7 @@ namespace ITAsset4.Common
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Warn($"WS 心跳异常: {ex.Message}"); }
+            catch (Exception ex) { Logger.Warn($"WS 心跳异常: {ExDetail(ex)}"); }
         }
 
         // ── 接收 ─────────────────────────────────────────────────────────────
@@ -175,7 +190,7 @@ namespace ITAsset4.Common
                         {
                             try { result = await ws.ReceiveAsync(new ArraySegment<byte>(buf), ct); }
                             catch (OperationCanceledException) { return; }
-                            catch (Exception ex) { Logger.Warn($"WS 接收异常: {ex.Message}"); return; }
+                            catch (Exception ex) { Logger.Warn($"WS 接收异常: {ExDetail(ex)}"); return; }
 
                             if (result.MessageType == WebSocketMessageType.Close)
                             { Logger.Info("WS 服务端关闭"); return; }
@@ -193,7 +208,7 @@ namespace ITAsset4.Common
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Warn($"WS 接收循环异常: {ex.Message}"); }
+            catch (Exception ex) { Logger.Warn($"WS 接收循环异常: {ExDetail(ex)}"); }
         }
 
         //  async，顺序 await 每个订阅者
@@ -229,7 +244,7 @@ namespace ITAsset4.Common
             }
             catch (Exception ex)
             {
-                Logger.Warn($"WS HandleMessage 解析异常: {ex.Message}");
+                Logger.Warn($"WS HandleMessage 解析异常: {ExDetail(ex)}");
             }
         }
 
@@ -278,7 +293,7 @@ namespace ITAsset4.Common
                 }
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { Logger.Warn($"WS send loop err: {ex.Message}"); }
+            catch (Exception ex) { Logger.Warn($"WS send loop err: {ExDetail(ex)}"); }
         }
 
         private static async Task<string> ReceiveOneAsync(ClientWebSocket ws, CancellationToken ct)
