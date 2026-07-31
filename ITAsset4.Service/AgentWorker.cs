@@ -45,6 +45,13 @@ namespace ITAsset4.Service
         private readonly Dictionary<int, DateTime> _deferred = new Dictionary<int, DateTime>();
         private readonly object _deferLock = new object();
 
+        // C3：任务去重。WS 推送与 10 分钟轮询可能下发同一任务，重复执行会导致双重安装/卸载。
+        // 窗口期内同一 task_id 仅执行一次（含正在执行中）。
+        private readonly TaskDedup _taskDedup = new TaskDedup(TimeSpan.FromMinutes(15));
+
+        // C3：限制任务执行并发度，避免一次拉取大量任务时无限并发打爆机器（线程安全、可降级）。
+        private readonly SemaphoreSlim _taskConcurrency = new SemaphoreSlim(4, 4);
+
         private DateTime _lastReportDate = DateTime.MinValue;
         private DateTime _lastTaskPoll   = DateTime.MinValue;
         private readonly SemaphoreSlim _taskPushSignal = new SemaphoreSlim(0, 1);
@@ -486,14 +493,35 @@ namespace ITAsset4.Service
                     }
                 }
 
-                //  每个 fire-and-forget 追加 ContinueWith 兜底异常记录
-                _ = RunTaskAsync(task, serial, ct).ContinueWith(t =>
+                // C3：任务去重——同一 task_id 在窗口期内（含正在执行）只跑一次，
+                // 避免 WS 推送与定时轮询重复下发导致双重执行。
+                int key = TaskKey(task);
+                if (_taskDedup.TryAcquire(key))
+                {
+                    Logger.Info($"[任务 {task.target_id}] task_id={key} 去重命中，跳过重复执行");
+                    continue;
+                }
+
+                // C3：限制并发度，避免无限并发。注意：RunTaskAsync 内部会据成败调用
+                // _taskDedup.MarkCompleted/MarkFailed 维护去重状态。
+                _ = Task.Run(async () =>
+                {
+                    await _taskConcurrency.WaitAsync(ct);
+                    try { await RunTaskAsync(task, serial, ct); }
+                    finally { _taskConcurrency.Release(); }
+                }).ContinueWith(t =>
                 {
                     if (t.IsFaulted && t.Exception != null)
                         Logger.Error($"[任务 {task.target_id}] 未处理异常: {t.Exception.InnerException?.Message}");
                 }, TaskContinuationOptions.OnlyOnFaulted);
             }
         }
+
+        /// <summary>
+        /// 任务去重键：优先用 task_id（服务端唯一标识），缺失时退化为 target_id。
+        /// </summary>
+        private static int TaskKey(TaskInfo task) =>
+            task.task_id > 0 ? task.task_id : task.target_id;
 
         private async Task RunTaskAsync(TaskInfo task, string serial, CancellationToken ct)
         {
@@ -513,6 +541,9 @@ namespace ITAsset4.Service
             {
                 Logger.Error($"[任务 {task.target_id}] 执行异常: {ex.Message}");
                 result = new TaskResult { success = false, message = ex.Message };
+                // C3：失败的任务清除去重记录，允许服务端后续重新派发重试
+                _taskDedup.MarkFailed(TaskKey(task));
+                return;
             }
             // ── 附带 Agent 版本号 ──
             result.executor_version = ClientVersion.Current;
@@ -523,6 +554,9 @@ namespace ITAsset4.Service
                 lock (_deferLock)
                     _deferred[task.target_id] = DateTime.Now.AddMinutes(deferMins);
                 Logger.Info($"[任务 {task.target_id}] 已推迟，{deferMins} 分钟后重试");
+                // 推迟的任务稍后会由 CheckDeferredAsync 重新拉取执行，这里清除去重记录以便其能再次运行
+                // （注意：推迟窗口内仍由 _deferred 字典拦截，不会立即重跑）
+                _taskDedup.MarkFailed(TaskKey(task));
             }
             else
             {
@@ -550,6 +584,9 @@ namespace ITAsset4.Service
                     Logger.Warn($"[任务 {task.target_id}] 同步上报软件清单失败: {ex.Message}");
                 }
             }
+
+            // C3：任务已终态（成功/推迟/报告完成），刷新去重时间戳，窗口期内不再重复执行
+            _taskDedup.MarkCompleted(TaskKey(task));
         }
 
         private async Task CheckDeferredAsync(CancellationToken ct)

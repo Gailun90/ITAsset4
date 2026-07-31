@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <!-- 直接编译纯逻辑源文件（不引用 net48 程序集），在 net9 下独立验证核心逻辑 -->
+  <ItemGroup>
+    <Compile Include="..\ITAsset4.Common\Logic\InstallerArgInference.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\ScriptEncoding.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\RebootGuard.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\TaskDedup.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\DownloadResume.cs" />
+  </ItemGroup>
+
+</Project>

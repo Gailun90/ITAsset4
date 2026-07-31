@@ -37,41 +37,15 @@ namespace ITAsset4.Service
         private static readonly Regex BlacklistRegex =
             new Regex(@"[\r\n`<>|&^]", RegexOptions.Compiled);
 
-        // P0 安全：禁止重启/关机关键词黑名单（服务端+客户端两端共享规则）
-        // 纵深防御：服务端已经拦过一次，但客户端作为最后防线必须独立检查
-        // 注意：Restart-Computer/Stop-Computer 必须在 \brestart\b 前面，
-        //       否则 bare restart 会先捕获 Restart-Computer 中的 restart 前缀
-        private static readonly Regex RebootBlacklist =
-            new Regex(
-                @"Restart-Computer|Stop-Computer" +
-                @"|wuauclt\s+/restart" +
-                @"|shutdown\.exe" +
-                @"|\bshutdown\b" +
-                @"|\breboot\b" +
-                @"|\brestart\b",
-                RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        // P0 安全：禁止重启/关机的纵深防御已移至纯逻辑类 ITAsset4.Common.RebootGuard。
+        // 它先在注释/字符串字面量层面清洗文本，再精确锚定真实的重启/关机指令，
+        // 既不会误杀 Restart-Service（仅重启服务），也不会被 Write-Host "will reboot" 这种提示文本骗过。
 
         /// <summary>
-        /// 去掉脚本里的注释行/行尾注释，避免"注释里提到 reboot/restart"被 RebootBlacklist 误判为
-        /// 真实的重启命令。覆盖 PowerShell/CMD 常见的 # / REM / :: 注释写法。
+        /// 去掉脚本里的注释行/行尾注释（委托给纯逻辑类 ScriptSanitizer，便于单测）。
         /// </summary>
-        private static string StripComments(string commandText)
-        {
-            if (string.IsNullOrEmpty(commandText)) return commandText ?? "";
-            var lines = new List<string>();
-            foreach (var raw in commandText.Split('\n'))
-            {
-                string line = raw;
-                string trimmed = line.Trim();
-                string upper = trimmed.ToUpperInvariant();
-                if (trimmed.StartsWith("#") || upper.StartsWith("REM ") || upper == "REM" || trimmed.StartsWith("::"))
-                    continue;
-                int hashPos = line.IndexOf('#');
-                if (hashPos >= 0) line = line.Substring(0, hashPos);
-                lines.Add(line);
-            }
-            return string.Join("\n", lines);
-        }
+        private static string StripComments(string commandText) =>
+            ScriptSanitizer.StripComments(commandText);
 
         // 卸载成功的退出码
         private static readonly int[] UninstallSuccessCodes =
@@ -217,7 +191,7 @@ namespace ITAsset4.Service
                 Logger.Info($"[任务 {task.target_id}] 用户确认，开始卸载");
             }
 
-            KillRelatedProcesses(swName);
+            await KillRelatedProcesses(task);
 
             // ===== L1: 获取卸载目标 =====
             var targets = GetUninstallTargets(swName);
@@ -236,7 +210,7 @@ namespace ITAsset4.Service
 
             // ===== L3: 统一验证 =====
             bool needsReboot = RebootRequiredCodes.Contains(exec.ExitCode);
-            bool success = VerifyUninstall(swName, exec.ExitCode);
+            bool success = await VerifyUninstall(swName, exec.ExitCode);
 
             // ── 需要重启时询问用户 ──
             if (success && needsReboot)
@@ -305,18 +279,22 @@ namespace ITAsset4.Service
             string file = Path.Combine(Path.GetTempPath(), $"itasset_cmd_{Guid.NewGuid():N}.{ext}");
             try
             {
-                File.WriteAllText(file, task.command ?? "", Encoding.UTF8);
+                // 修复：.bat/.cmd 必须以“无 BOM 的 UTF-8”写入，否则 cmd.exe 首行被 BOM 干扰；
+                // .ps1 保留 BOM（兼容旧版 PowerShell 编码探测）。
+                File.WriteAllText(file, task.command ?? "", ScriptEncoding.ForFileName(file));
 
                 // ── P0 安全纵深防御：客户端独立扫描重启/关机关键词 ──
-                var rebootHit = RebootBlacklist.Match(StripComments(task.command ?? ""));
-                if (rebootHit.Success)
+                // 使用纯逻辑 RebootGuard：先洗掉注释与字符串字面量，再精确匹配真实重启/关机指令，
+                // 不会误杀 Restart-Service / Write-Host "will reboot"。
+                string cmd = StripComments(task.command ?? "");
+                if (RebootGuard.ContainsRebootShutdown(cmd))
                 {
-                    Logger.Error($"[安全 命令任务 {task.target_id}] 命令包含禁止的重启/关机操作，拒绝执行。命中: {rebootHit.Value}");
+                    Logger.Error($"[安全 命令任务 {task.target_id}] 命令包含禁止的重启/关机操作，拒绝执行。");
                     return new TaskResult
                     {
                         success    = false,
                         exit_code  = -1,
-                        message    = $"SECURITY_BLOCKED: 命令包含禁止的重启/关机操作（命中: {rebootHit.Value}）",
+                        message    = "SECURITY_BLOCKED: 命令包含禁止的重启/关机操作",
                     };
                 }
 
@@ -824,28 +802,11 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // 推断静默参数
         // ═══════════════════════════════════════════════
-        private static string InferSilentArgs(string originalArgs, string exe)
-        {
-            string ext = Path.GetExtension(exe).ToLower();
-
-            if (originalArgs.IndexOf("/SILENT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                originalArgs.IndexOf("/VERYSILENT", StringComparison.OrdinalIgnoreCase) >= 0)
-                return originalArgs;
-
-            if (originalArgs.IndexOf("/SILENT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                originalArgs.IndexOf("/VERYSILENT", StringComparison.OrdinalIgnoreCase) >= 0)
-                return originalArgs;
-
-            if (ext == ".msi" || exe.IndexOf("msiexec", StringComparison.OrdinalIgnoreCase) >= 0)
-                return originalArgs + " /quiet /norestart";
-
-            if (originalArgs.IndexOf("/quiet", StringComparison.OrdinalIgnoreCase) < 0 &&
-                originalArgs.IndexOf("/S ", StringComparison.OrdinalIgnoreCase) < 0 &&
-                originalArgs.IndexOf("/SILENT", StringComparison.OrdinalIgnoreCase) < 0)
-                return originalArgs + " /quiet /norestart";
-
-            return originalArgs;
-        }
+        // 推断静默参数（委托给纯逻辑类 InstallerArgInference，便于单测）。
+        // 已修复：去除了原先重复的 /SILENT 分支；NSIS 卸载器补 /S，
+        // InnoSetup 补 /SILENT /VERYSILENT /SUPPRESSMSGBOXES，MSI 补 /quiet /norestart。
+        private static string InferSilentArgs(string originalArgs, string exe) =>
+            InstallerArgInference.InferSilentArgs(originalArgs, exe);
 
         private static bool IsGuid(string s)
         {
@@ -922,7 +883,8 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // L3: 统一验证
         // ═══════════════════════════════════════════════
-        internal static bool VerifyUninstall(string swName, int exitCode)
+        internal static async Task<bool> VerifyUninstall(string swName, int exitCode,
+            System.Threading.CancellationToken ct = default(System.Threading.CancellationToken))
         {
             bool exitCodeOk = UninstallSuccessCodes.Contains(exitCode);
 
@@ -932,7 +894,10 @@ namespace ITAsset4.Service
                 return true;
             }
 
-            Thread.Sleep(10000);
+            // 修复：原来 Thread.Sleep(10000) 会阻塞线程池线程（VerifyUninstall 在 async 方法链中
+            // 被同步等待），改为 await Task.Delay 释放线程，不阻塞线程池、可被取消。
+            try { await Task.Delay(10000, ct); }
+            catch (OperationCanceledException) { }
 
             var remaining = FindAllUninstallInfos(swName);
             if (remaining.Count == 0)
@@ -985,28 +950,22 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // 进程清理
         // ═══════════════════════════════════════════════
-        internal static void KillRelatedProcesses(string softwareName)
+        // 修复（C3）：原先是“硬编码中文软件名 → 进程名”映射表（死代码式数据、无法覆盖未知软件、
+        // 且与国际版软件名脱节）。现改为数据驱动：直接消费服务端下发的 task.process_fence
+        // （JSON 数组，如 ["wechat","wxwork"]，不含 .exe），由任务字段决定要清理哪些进程。
+        // 这样部署逻辑与具体软件解耦，新增软件无需改代码；同时消费了原先声明却从未使用的
+        // process_fence 字段。
+        internal static async Task KillRelatedProcesses(TaskInfo task)
         {
-            var map = new Dictionary<string, string[]>
+            var names = ParseProcessFence(task?.process_fence);
+            if (names.Count == 0)
             {
-                { "企业微信", new[] { "WXWork", "WXWorkApp" } },
-                { "WeCom", new[] { "WXWork", "WXWorkApp" } },
-                { "微信", new[] { "WeChat" } },
-                { "Webex", new[] { "CiscoCollabHost", "WebexHost" } },
-                { "QQ", new[] { "QQ", "QQProtect" } },
-                { "钉钉", new[] { "DingTalk" } },
-                { "Teams", new[] { "Teams" } },
-                { "飞书", new[] { "Lark" } },
-                { "Zoom", new[] { "Zoom" } }
-            };
+                Logger.Info("[进程清理] task.process_fence 为空，跳过进程清理");
+                return;
+            }
 
-            var kill = new List<string>();
-
-            foreach (var kv in map)
-                if (softwareName.Contains(kv.Key))
-                    kill.AddRange(kv.Value);
-
-            foreach (var p in kill)
+            Logger.Info($"[进程清理] 依据 process_fence 清理进程: {string.Join(",", names)}");
+            foreach (var p in names)
             {
                 try
                 {
@@ -1020,7 +979,39 @@ namespace ITAsset4.Service
                 catch { }
             }
 
-            Thread.Sleep(1500);
+            // 给被清理进程一点退出时间（await 释放线程池线程，不在卸载关键异步链上阻塞）
+            await Task.Delay(1500);
+        }
+
+        /// <summary>
+        /// 解析 process_fence：优先按 JSON 数组解析（["a","b"]），失败则按逗号分隔兜底。
+        /// 返回去重后的进程名列表（不含 .exe 后缀）。
+        /// </summary>
+        private static List<string> ParseProcessFence(string raw)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(raw)) return result;
+
+            try
+            {
+                var arr = Newtonsoft.Json.Linq.JArray.Parse(raw);
+                foreach (var tok in arr)
+                {
+                    string s = (string)tok;
+                    if (!string.IsNullOrWhiteSpace(s))
+                        result.Add(Path.GetFileNameWithoutExtension(s.Trim()));
+                }
+                if (result.Count > 0) return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            }
+            catch { /* 不是合法 JSON 数组，走逗号兜底 */ }
+
+            foreach (var part in raw.Split(','))
+            {
+                string s = part.Trim().Trim('"', '[', ']', ' ');
+                if (!string.IsNullOrWhiteSpace(s))
+                    result.Add(Path.GetFileNameWithoutExtension(s));
+            }
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
         // ═══════════════════════════════════════════════
@@ -1045,6 +1036,16 @@ namespace ITAsset4.Service
                     Logger.Error(err);
                     return (-1, $"SECURITY_VIOLATION: {err}");
                 }
+
+                // 重启/关机纵深防御：install / uninstall 经此路径执行，args 里若被错误下发
+                // /forcerestart、shutdown 等重启指令，必须拒掉（与 run_command 一致）。
+                // 字符串字面量会被 RebootGuard 先行清洗，避免路径中恰巧含 "restart" 被误伤。
+                if (!string.IsNullOrEmpty(arguments) && RebootGuard.ContainsRebootShutdown(arguments))
+                {
+                    string err = $"[安全] 参数包含禁止的重启/关机操作，拒绝执行: {arguments}";
+                    Logger.Error(err);
+                    return (-1, $"SECURITY_VIOLATION: {err}");
+                }
             }
 
             var si = new ProcessStartInfo
@@ -1064,20 +1065,15 @@ namespace ITAsset4.Service
 
             using var p = new Process { StartInfo = si };
 
-            p.OutputDataReceived += (_, e) =>
-            {
-                if (e.Data != null) output.AppendLine(e.Data);
-            };
-            p.ErrorDataReceived += (_, e) =>
-            {
-                if (e.Data != null) error.AppendLine(e.Data);
-            };
-
             try
             {
                 p.Start();
-                p.BeginOutputReadLine();
-                p.BeginErrorReadLine();
+
+                // 修复输出截断竞态（C3）：原先 BeginOutputReadLine + WaitForExit 在 WaitForExit 返回后
+                // 异步事件可能仍未刷完，导致 install_log 丢尾部。改为在独立线程并发 ReadToEnd 两条流，
+                // 互不阻塞（避免死锁），进程退出后流到达 EOF，再 Task.WhenAll 等待读取完成，确保完整捕获。
+                var stdoutTask = Task.Run(() => ReadToEndSafe(p.StandardOutput));
+                var stderrTask = Task.Run(() => ReadToEndSafe(p.StandardError));
 
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSec));
                 var deadline = DateTime.Now.AddSeconds(timeoutSec);
@@ -1105,13 +1101,21 @@ namespace ITAsset4.Service
                     catch { }
 
                     try { p.WaitForExit(); } catch { }
+                }
 
+                // 确保进程已退出，再等待后台读取收尾（进程已关闭 stdout/stderr 句柄，ReadToEnd 会到达 EOF）
+                try { p.WaitForExit(5000); } catch { }
+                try { await Task.WhenAll(stdoutTask, stderrTask); } catch { }
+
+                output.Append(stdoutTask.Result ?? "");
+                error.Append(stderrTask.Result ?? "");
+
+                if (!exited)
+                {
                     string log = $"TIMEOUT after {timeoutSec}s (exit code not available)\nSTDOUT:\n{output}\nSTDERR:\n{error}";
                     _ = FireAuditAsync(auditReporter, fileName, arguments, null, null);
                     return (-1, log);
                 }
-
-                try { p.WaitForExit(5000); } catch { }
 
                 string finalLog = $"EXIT CODE: {p.ExitCode}\nSTDOUT:\n{output}\nSTDERR:\n{error}";
                 _ = FireAuditAsync(auditReporter, fileName, arguments, p.Id, p.ExitCode);
@@ -1128,6 +1132,13 @@ namespace ITAsset4.Service
         // ═══════════════════════════════════════════════
         // 审计上报
         // ═══════════════════════════════════════════════
+        // 安全读取进程输出流（进程异常退出时流可能已关闭，读取会抛异常，这里兜底返回空串）
+        private static string ReadToEndSafe(System.IO.StreamReader reader)
+        {
+            try { return reader?.ReadToEnd() ?? ""; }
+            catch { return ""; }
+        }
+
         private static async Task FireAuditAsync(
             Func<string, string, int?, int?, DateTime, Task> reporter,
             string processPath, string args, int? pid, int? exitCode)

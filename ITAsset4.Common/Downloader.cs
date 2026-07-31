@@ -87,12 +87,16 @@ namespace ITAsset4.Common
                 http.DefaultRequestHeaders.Add("X-Timestamp", ts);
                 http.DefaultRequestHeaders.Add("X-Signature", sig);
 
-                if (startPos > 0)
+                bool rangeRequested = startPos > 0;
+                if (rangeRequested)
                     http.DefaultRequestHeaders.Range = new RangeHeaderValue(startPos, null);
 
                 var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-                if (resp.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+                int status = (int)resp.StatusCode;
+
+                if (status == (int)System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
                 {
+                    // 416：片段已失效，覆盖重写整文件
                     startPos = 0;
                     http.DefaultRequestHeaders.Range = null;
                     resp.Dispose();
@@ -105,7 +109,33 @@ namespace ITAsset4.Common
                 {
                     resp.EnsureSuccessStatusCode();
                     contentLength = resp.Content.Headers.ContentLength;
-                    await SaveStreamAsync(resp, dest, startPos, bandwidthLimitKb, ct);
+
+                    // 修复（C3）：原先 resume 只处理 416，若服务器对带 Range 的请求返回 200
+                    // （忽略 Range 头），会走 else 直接“追加”写，导致文件前半段重复、整文件损坏。
+                    // 改用纯逻辑 DownloadResume.Decide 决策：仅当真正的 206 才追加，
+                    // 416 / 200 一律覆盖从 0 开始。
+                    var decision = DownloadResume.Decide(startPos, rangeRequested, status);
+                    long writeOffset = decision.Append ? startPos : 0;
+
+                    // 额外防御：206 时校验 Content-Range 起点与本地片段一致，否则覆盖重写
+                    if (status == 206 && !decision.Append)
+                    {
+                        writeOffset = 0;
+                    }
+                    else if (status == 206)
+                    {
+                        var cr = resp.Content.Headers.ContentRange;
+                        if (cr != null && cr.From.HasValue && cr.From.Value != startPos)
+                        {
+                            Logger.Warn($"[下载] Content-Range 起点({cr.From.Value})≠本地片段({startPos})，覆盖重写");
+                            writeOffset = 0;
+                        }
+                    }
+
+                    if (!decision.Append)
+                        Logger.Warn($"[下载] 服务器未续传（status={status}），从 0 覆盖写入");
+
+                    await SaveStreamAsync(resp, dest, writeOffset, bandwidthLimitKb, ct);
                 }
             }
 
