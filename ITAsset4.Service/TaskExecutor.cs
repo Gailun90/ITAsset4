@@ -1048,6 +1048,21 @@ namespace ITAsset4.Service
                 }
             }
 
+            // ── MSI 适配：.msi 文件不能用 UseShellExecute=false 直接启动，
+            // 必须经由 msiexec.exe /i 来安装，否则 Process.Start 会抛 Win32Exception。
+            // 仅当文件名以 .msi 结尾且 arguments 里尚未包含 /i 标志时才自动包装，
+            // 防止调用方已手动传入 "msiexec /i xxx.msi" 时出现 double-wrap。
+            if (string.Equals(Path.GetExtension(fileName), ".msi", StringComparison.OrdinalIgnoreCase)
+                && (string.IsNullOrWhiteSpace(arguments)
+                    || !arguments.TrimStart().StartsWith("/i ", StringComparison.OrdinalIgnoreCase)))
+            {
+                string quotedMsi = $"\"{fileName}\"";
+                string extraArgs = string.IsNullOrWhiteSpace(arguments) ? "" : " " + arguments;
+                arguments = $"/i {quotedMsi}{extraArgs}";
+                fileName  = "msiexec.exe";
+                Logger.Info($"[MSI] 自动转换为 msiexec: {fileName} {arguments}");
+            }
+
             var si = new ProcessStartInfo
             {
                 FileName = fileName,
