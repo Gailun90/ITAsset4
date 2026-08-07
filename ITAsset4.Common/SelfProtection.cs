@@ -64,6 +64,7 @@ namespace ITAsset4.Common
         private struct WINTRUST_FILE_INFO
         {
             public int cbStruct;
+            [MarshalAs(UnmanagedType.LPWStr)]
             public string pcwszFilePath;
             public IntPtr hFile;
             public IntPtr pgKnownSubject;
@@ -87,11 +88,15 @@ namespace ITAsset4.Common
             public IntPtr pSignatureSettings;
         }
 
-        [DllImport("wintrust.dll", ExactSpelling = true, SetLastError = false, CharSet = CharSet.Unicode)]
+        // 修复「无法封送处理 parameter #3: 无效的托管/非托管类型组合」：
+        // 原代码用 [MarshalAs(LPStruct)] 传递嵌套 private struct，在部分 CLR 上会抛 MarshalDirectiveException，
+        // 导致 VerifyAuthenticode 永远走 catch 分支、自保护签名校验形同虚设。
+        // 改为对两个结构体都用 ref 传递（pinned pointer），彻底规避 LPStruct 的封送限制。
+        [DllImport("wintrust.dll", SetLastError = false, CharSet = CharSet.Unicode)]
         private static extern int WinVerifyTrust(
             IntPtr hwnd,
-            [MarshalAs(UnmanagedType.LPStruct)] Guid pgActionID,
-            [MarshalAs(UnmanagedType.LPStruct)] WINTRUST_DATA pWVTData);
+            ref Guid pgActionID,
+            ref WINTRUST_DATA pWVTData);
 
         private static readonly Guid WINTRUST_ACTION_GENERIC_VERIFY_V2 =
             new Guid("{00AAC56B-CD44-11d3-8A60-0000C0A8AD00}");
@@ -128,7 +133,9 @@ namespace ITAsset4.Common
                 Marshal.StructureToPtr(fileInfo, wtd.pFile, false);
                 try
                 {
-                    int result = WinVerifyTrust(IntPtr.Zero, WINTRUST_ACTION_GENERIC_VERIFY_V2, wtd);
+                    // static readonly Guid 不能作为 ref 实参，复制一份局部变量再传 ref
+                    var actionId = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+                    int result = WinVerifyTrust(IntPtr.Zero, ref actionId, ref wtd);
                     if (result != 0)
                     {
                         Logger.Warn($"[自保护] Authenticode 校验失败: 0x{result:X8}");
