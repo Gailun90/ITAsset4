@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.Windows.Forms;
 using ITAsset4.Common;
+using Microsoft.Win32;
 
 namespace ITAsset4.Tray
 {
@@ -11,7 +13,9 @@ namespace ITAsset4.Tray
     ///   - PipeScreenServer: \\.\pipe\ITAsset4_{sessionId}_Screen（截图+弹窗）
     ///   - PipeInputServer:  \\.\pipe\ITAsset4_{sessionId}_Input（鼠标输入）
     /// 
-    /// 命名管道是 per-session 的，无需端口冲突处理和会话看守线程。
+    /// 管道名中的 sessionId 使用"活跃且已解锁的物理控制台会话"（单一真相源，
+    /// 与 Service 端共用 WtsSessionHelper），避免两端 session 不一致导致连接超时。
+    /// 仅在当前进程确属该控制台会话时才注册管道；锁屏/注销时主动关闭，解锁后重新打开。
     /// </summary>
     public class TrayApplicationContext : ApplicationContext
     {
@@ -24,16 +28,47 @@ namespace ITAsset4.Tray
             PipeServer.StartInputWorker();
 
             _screenServer = new PipeScreenServer();
-            _screenServer.Start();
-
             _inputServer = new PipeInputServer();
-            _inputServer.Start();
+
+            // 仅在"活跃且已解锁的物理控制台会话"且本进程正属该 session 时才注册管道；
+            // 否则进入待机监听，待解锁（SessionUnlock）再开启。
+            if (!WtsSessionHelper.IsPhysicalDesktopActiveAndUnlocked(out int mySid)
+                || mySid != Process.GetCurrentProcess().SessionId)
+            {
+                Logger.Info("当前非活跃解锁的物理桌面 session，暂不注册屏幕/输入管道，进入待机监听");
+            }
+            else
+            {
+                _screenServer.Start();
+                _inputServer.Start();
+            }
 
             Logger.Info("Tray 应用已启动（命名管道模式）");
+
+            // 订阅锁屏/解锁/注销事件，动态开关管道：
+            // 锁屏时主动断开（锁屏状态本就不该允许远程看屏幕），解锁后重新打开。
+            SystemEvents.SessionSwitch += OnSessionSwitch;
+        }
+
+        private void OnSessionSwitch(object sender, SessionSwitchEventArgs e)
+        {
+            switch (e.Reason)
+            {
+                case SessionSwitchReason.SessionUnlock:
+                    if (!_screenServer.IsRunning) _screenServer.Start();
+                    if (!_inputServer.IsRunning) _inputServer.Start();
+                    break;
+                case SessionSwitchReason.SessionLock:
+                case SessionSwitchReason.SessionLogoff:
+                    if (_screenServer.IsRunning) _screenServer.Stop();
+                    if (_inputServer.IsRunning) _inputServer.Stop();
+                    break;
+            }
         }
 
         protected override void ExitThreadCore()
         {
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
             _inputServer?.Stop();
             _screenServer?.Stop();
             PipeServer.StopInputWorker();

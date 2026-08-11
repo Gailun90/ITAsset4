@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.ServiceProcess;
 using System.Threading;
 using System.Threading.Tasks;
 using ITAsset4.Common;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
 
 namespace ITAsset4.Service
 {
@@ -213,14 +216,17 @@ namespace ITAsset4.Service
                                     Logger.Info("[Remote] viewer_connected，启动远程桌面");
                                     if (_remoteScreen != null && !_remoteScreen.IsRunning)
                                     {
-                                        // 连接 Pipe 到 Tray
-                                        int sid = _sessionMgr.GetActiveSessionId();
-                                        if (sid > 0)
+                                        ScreenRequestResult result = await TryStartRemoteScreenAsync();
+                                        if (!result.Success)
                                         {
-                                            await _screenClient.ConnectAsync(sid);
-                                            await _inputClient.ConnectAsync(sid);
+                                            Logger.Warn($"[Remote] {result.Message}");
+                                            // 明确告知前端：不是超时，而是当前就不可用（锁屏/未登录/Tray未运行）
+                                            await _wsClient.SendAsync(JsonConvert.SerializeObject(new
+                                            {
+                                                type = "remote_unavailable",
+                                                message = result.Message,
+                                            }));
                                         }
-                                        _remoteScreen.Start();
                                     }
                                 }
                                 else if (msgType == "remote_stop")
@@ -587,6 +593,56 @@ namespace ITAsset4.Service
 
             // C3：任务已终态（成功/推迟/报告完成），刷新去重时间戳，窗口期内不再重复执行
             _taskDedup.MarkCompleted(TaskKey(task));
+        }
+
+        /// <summary>
+        /// 远程桌面连接前的前置检查 + 连接。
+        /// 使用 WtsSessionHelper 单一真相源（与 Tray 端完全一致），避免两端 session 错配导致的超时。
+        /// 返回 ScreenRequestResult，Success=false 时 Message 明确区分三种不可用原因。
+        /// </summary>
+        private async Task<ScreenRequestResult> TryStartRemoteScreenAsync()
+        {
+            // 1) 当前是否存在"活跃且已解锁"的物理控制台会话
+            if (!WtsSessionHelper.IsPhysicalDesktopActiveAndUnlocked(out int sid))
+            {
+                // 明确告诉调用方：不是超时，是当前就不可用
+                return new ScreenRequestResult
+                {
+                    Success = false,
+                    Message = "远程桌面不可用：当前无人登录或处于锁屏状态",
+                };
+            }
+
+            // 2) 该 session 下是否存在 Tray 进程（管道服务端）
+            var tray = Process.GetProcessesByName("ITAsset4.Tray")
+                               .FirstOrDefault(p => p.SessionId == sid);
+            if (tray == null)
+            {
+                Logger.Warn($"Session {sid} 处于活跃解锁状态，但未发现 Tray 进程，运维问题");
+                return new ScreenRequestResult
+                {
+                    Success = false,
+                    Message = "远程桌面不可用：Tray 未运行",
+                };
+            }
+
+            // 3) 连接管道（屏幕 + 输入），3 秒超时
+            try
+            {
+                if (_screenClient == null) _screenClient = new PipeScreenClient();
+                await _screenClient.ConnectAsync(sid, TimeSpan.FromSeconds(3));
+                await _inputClient.ConnectAsync(sid);
+                _remoteScreen.Start();
+                return new ScreenRequestResult { Success = true };
+            }
+            catch (System.TimeoutException)
+            {
+                return new ScreenRequestResult
+                {
+                    Success = false,
+                    Message = "远程桌面不可用：连接超时",
+                };
+            }
         }
 
         private async Task CheckDeferredAsync(CancellationToken ct)

@@ -14,7 +14,7 @@ namespace ITAsset4.Common
     {
         // ⚠️ 每次发版必须同步 bump 此常量！上一版 1.2.11 漏改此值（仍是 1.2.10），
         // 导致客户端本地版本恒为 1.2.10 < 服务端 1.2.11，触发无限自更新循环。
-        public const string Current = "1.2.11";
+        public const string Current = "1.2.12";
 
         /// <summary>
         /// 将 "1.1.0" 形式的版本号解析为可比较的 (major,minor,build) 元组。

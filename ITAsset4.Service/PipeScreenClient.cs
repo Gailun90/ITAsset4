@@ -38,6 +38,21 @@ namespace ITAsset4.Service
         }
 
         /// <summary>
+        /// 带超时参数的连接重载。超时抛出 TimeoutException（调用方据此区分"连接超时"）。
+        /// </summary>
+        public async Task ConnectAsync(int sessionId, TimeSpan timeout)
+        {
+            _sessionId = sessionId;
+            string pipeName = $"ITAsset4_{sessionId}_Screen";
+            Logger.Info($"[PipeScreenClient] 连接 \\\\.\\pipe\\{pipeName} (timeout={(int)timeout.TotalMilliseconds}ms)");
+
+            _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            await _pipe.ConnectAsync((int)timeout.TotalMilliseconds);
+            _pipe.ReadMode = PipeTransmissionMode.Byte;
+            Logger.Info("[PipeScreenClient] 已连接");
+        }
+
+        /// <summary>
         /// 发送请求并返回响应（兼容 TcpScreenClient.SendAsync）
         /// </summary>
         public async Task<PipeResponse> SendAsync(PipeRequest request)

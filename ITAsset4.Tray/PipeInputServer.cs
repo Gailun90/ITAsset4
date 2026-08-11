@@ -26,6 +26,8 @@ namespace ITAsset4.Tray
             _sessionId = System.Diagnostics.Process.GetCurrentProcess().SessionId;
         }
 
+        public bool IsRunning => _cts != null && !_cts.IsCancellationRequested;
+
         public void Start()
         {
             _cts = new CancellationTokenSource();
