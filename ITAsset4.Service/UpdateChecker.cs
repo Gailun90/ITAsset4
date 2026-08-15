@@ -53,6 +53,25 @@ namespace ITAsset4.Service
 
             Logger.Info($"[更新] 发现新版本 {info.version}（本地 {ClientVersion.Current}），mandatory={info.mandatory}");
 
+            // ── 防循环闸门（H1，§4.8 #1）：同一目标版本在冷却窗口内重试超限即拒绝 ──
+            // 持久化状态落盘，确保跨 Service 重启也能打破"漏 bump 版本"导致的无限自更新循环。
+            var guardDecision = UpdateLoopGuard.Evaluate(info.version, LoadGuardState(), DateTime.UtcNow);
+            SaveGuardState(guardDecision.Next);
+            if (!guardDecision.Allowed)
+            {
+                Logger.Error($"[更新] {guardDecision.Reason}");
+                return;
+            }
+
+            // ── 更新包策略（H2，§4.8 #2）：必须携带非空 version 与 SHA256 ──
+            // 旧逻辑 hash 为空直接跳过校验并应用；现统一为"空 hash 即拒绝"，与任务包策略一致。
+            var policy = UpdatePolicy.ValidateUpdatePackage(info.version, info.hash);
+            if (!policy.ok)
+            {
+                Logger.Error($"[更新] {policy.reason}");
+                return;
+            }
+
             string staging = Path.Combine(_cfg.BaseDir, "updates", info.version);
             try { Directory.CreateDirectory(staging); } catch { }
             string zipPath = Path.Combine(staging, "update.zip");
@@ -65,18 +84,15 @@ namespace ITAsset4.Service
                 return;
             }
 
-            // SHA256 校验
-            if (!string.IsNullOrEmpty(info.hash))
+            // SHA256 校验（H2：到此处 info.hash 必非空；仍做实际比对以拦截传输损坏）
+            string actual = ComputeSha256(zipPath);
+            if (!string.Equals(actual, info.hash, StringComparison.OrdinalIgnoreCase))
             {
-                string actual = ComputeSha256(zipPath);
-                if (!string.Equals(actual, info.hash, StringComparison.OrdinalIgnoreCase))
-                {
-                    Logger.Error($"[更新] 校验失败: 期望 {info.hash} 实际 {actual}");
-                    try { File.Delete(zipPath); } catch { }
-                    return;
-                }
-                Logger.Info("[更新] SHA256 校验通过");
+                Logger.Error($"[更新] 校验失败: 期望 {info.hash} 实际 {actual}");
+                try { File.Delete(zipPath); } catch { }
+                return;
             }
+            Logger.Info("[更新] SHA256 校验通过");
 
             ApplyUpdate(info, zipPath, staging);
         }
@@ -128,6 +144,44 @@ namespace ITAsset4.Service
             var sb = new StringBuilder();
             foreach (var b in hash) sb.Append(b.ToString("x2"));
             return sb.ToString();
+        }
+
+        // ── 防循环闸门状态持久化（H1）──
+        // 状态必须落盘：Service 每次更新后会被 Updater 停止/重启，进程内存无法跨重启保留，
+        // 而"漏 bump 版本"的无限循环恰恰发生在跨重启场景，故用文件持久化打破它。
+
+        private string GuardStateFile =>
+            Path.Combine(_cfg.BaseDir, "updates", ".update_guard.json");
+
+        private UpdateLoopGuard.State LoadGuardState()
+        {
+            try
+            {
+                if (File.Exists(GuardStateFile))
+                {
+                    var s = JsonConvert.DeserializeObject<UpdateLoopGuard.State>(File.ReadAllText(GuardStateFile));
+                    if (s != null) return s;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[更新] 读取防循环状态失败，按全新状态处理: {ex.Message}");
+            }
+            return new UpdateLoopGuard.State();
+        }
+
+        private void SaveGuardState(UpdateLoopGuard.State state)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(GuardStateFile);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(GuardStateFile, JsonConvert.SerializeObject(state), Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"[更新] 写入防循环状态失败（不影响本次更新）: {ex.Message}");
+            }
         }
     }
 }

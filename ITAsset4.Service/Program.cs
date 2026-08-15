@@ -122,27 +122,22 @@ namespace ITAsset4.Service
                 StartupTrace($"AppConfig loaded (ServerUrl={cfg.ServerUrl})");
 
                 // ── 自保护（最终形态·一）：校验 Agent 二进制签名 + 配置签名 ──
+                // 方案 A（§4.8 #3 修正）：config 签名降级为告警，永不拒绝启动；
+                // 硬拒仅保留给二进制 Authenticode（真实篡改威胁）。裁决逻辑抽至
+                // SelfProtectDecision.ShouldRejectStart，已由单测+变异锁定不变式。
                 StartupTrace("self-protection begin");
-                if (!SelfProtection.VerifyAuthenticode(exePath))
+                bool authOk = SelfProtection.VerifyAuthenticode(exePath);
+                bool cfgOk  = SelfProtection.VerifyConfigSignature(cfgPath);
+                if (SelfProtectDecision.ShouldRejectStart(authOk, cfgOk, SelfProtection.Enforce))
                 {
-                    string msg = "[自保护] Authenticode 校验失败：Agent 二进制可能已被篡改。";
+                    string msg = "[自保护] 拒绝启动：Agent 二进制 Authenticode 校验失败（Enforce=true）。";
                     StartupTrace(msg);
-                    if (SelfProtection.Enforce)
-                    {
-                        Logger.Error(msg);
-                        return;
-                    }
+                    Logger.Error(msg);
+                    return;
                 }
-                if (!SelfProtection.VerifyConfigSignature(cfgPath))
-                {
-                    string msg = "[自保护] 配置文件签名校验失败：config.ini 可能被篡改。";
-                    StartupTrace(msg);
-                    if (SelfProtection.Enforce)
-                    {
-                        Logger.Error(msg);
-                        return;
-                    }
-                }
+                // 非拒绝情形：按需记告警（config 失败永远仅告警；二进制失败在非强制模式也仅告警）
+                if (!authOk) Logger.Warn("[自保护] 二进制 Authenticode 校验失败（仅告警，不阻断启动）");
+                if (!cfgOk)  Logger.Warn("[自保护] 配置文件签名校验失败：config.ini 可能被篡改（仅告警，不阻断启动）");
                 StartupTrace("self-protection OK");
 
                 // ── 构建 DI 容器 ──

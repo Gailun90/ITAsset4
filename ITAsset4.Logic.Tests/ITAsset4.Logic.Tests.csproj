@@ -21,6 +21,9 @@
     <Compile Include="..\ITAsset4.Common\Logic\RebootGuard.cs" />
     <Compile Include="..\ITAsset4.Common\Logic\TaskDedup.cs" />
     <Compile Include="..\ITAsset4.Common\Logic\DownloadResume.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\UpdateLoopGuard.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\UpdatePolicy.cs" />
+    <Compile Include="..\ITAsset4.Common\Logic\SelfProtectDecision.cs" />
   </ItemGroup>
 
 </Project>

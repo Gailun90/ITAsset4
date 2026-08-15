@@ -284,4 +284,139 @@ namespace ITAsset4.Logic.Tests
             Assert.False(d.TryAcquire(5));   // 失败后允许立即重新派发
         }
     }
+
+    // ── H1：自更新防循环闸门（§4.8 #1）──
+    public class UpdateLoopGuardTests
+    {
+        private static DateTime T(int day) => new DateTime(2026, 1, day, 0, 0, 0, DateTimeKind.Utc);
+
+        [Fact]
+        public void FreshState_AllowsFirstAttempt()
+        {
+            var d = UpdateLoopGuard.Evaluate("1.3.0", null, T(1));
+            Assert.True(d.Allowed);
+            Assert.Equal("1.3.0", d.Next.LastTargetVersion);
+            Assert.Equal(1, d.Next.AttemptsForTarget);
+        }
+
+        [Fact]
+        public void SameVersion_WithinWindow_AllowsUpToMax()
+        {
+            var s = new UpdateLoopGuard.State { LastTargetVersion = "1.3.0", AttemptsForTarget = 1, WindowStartUtcTicks = T(1).Ticks };
+            var d = UpdateLoopGuard.Evaluate("1.3.0", s, T(1).AddHours(1));
+            Assert.True(d.Allowed);
+            Assert.Equal(2, d.Next.AttemptsForTarget);
+        }
+
+        [Fact]
+        public void SameVersion_ExceedingMax_Refuses()
+        {
+            // 第 4 次尝试（计数从 3→4，超过上限 3）→ 必须拒绝，否则无限循环
+            var s = new UpdateLoopGuard.State { LastTargetVersion = "1.3.0", AttemptsForTarget = 3, WindowStartUtcTicks = T(1).Ticks };
+            var d = UpdateLoopGuard.Evaluate("1.3.0", s, T(1).AddHours(1));
+            Assert.False(d.Allowed);
+            Assert.Contains("1.3.0", d.Reason);
+        }
+
+        [Fact]
+        public void VersionSwitch_ResetsCount()
+        {
+            var s = new UpdateLoopGuard.State { LastTargetVersion = "1.2.9", AttemptsForTarget = 99, WindowStartUtcTicks = T(1).Ticks };
+            var d = UpdateLoopGuard.Evaluate("1.3.0", s, T(1).AddHours(1));
+            Assert.True(d.Allowed);
+            Assert.Equal(1, d.Next.AttemptsForTarget);
+            Assert.Equal("1.3.0", d.Next.LastTargetVersion);
+        }
+
+        [Fact]
+        public void CooldownExpired_ResetsCount()
+        {
+            var s = new UpdateLoopGuard.State { LastTargetVersion = "1.3.0", AttemptsForTarget = 99, WindowStartUtcTicks = T(1).Ticks };
+            var d = UpdateLoopGuard.Evaluate("1.3.0", s, T(1).AddHours(25)); // 默认冷却 24h
+            Assert.True(d.Allowed);
+            Assert.Equal(1, d.Next.AttemptsForTarget);
+        }
+
+        [Fact]
+        public void AtExactMaxBoundary_Allowed()
+        {
+            // 上限 3：计数 1/2/3 放行，第 4 次起拒绝。此处 2→3 仍放行
+            var s = new UpdateLoopGuard.State { LastTargetVersion = "1.3.0", AttemptsForTarget = 2, WindowStartUtcTicks = T(1).Ticks };
+            var d = UpdateLoopGuard.Evaluate("1.3.0", s, T(1).AddHours(1));
+            Assert.True(d.Allowed);
+            Assert.Equal(3, d.Next.AttemptsForTarget);
+        }
+    }
+
+    // ── H2：更新包强制 hash（§4.8 #2）──
+    public class UpdatePolicyTests
+    {
+        [Fact]
+        public void EmptyHash_Rejected()
+        {
+            var (ok, reason) = UpdatePolicy.ValidateUpdatePackage("1.3.0", "");
+            Assert.False(ok);
+            Assert.Contains("SHA256", reason);
+        }
+
+        [Fact]
+        public void NullHash_Rejected()
+        {
+            var (ok, _) = UpdatePolicy.ValidateUpdatePackage("1.3.0", null);
+            Assert.False(ok);
+        }
+
+        [Fact]
+        public void EmptyVersion_Rejected()
+        {
+            var (ok, _) = UpdatePolicy.ValidateUpdatePackage("", "deadbeef");
+            Assert.False(ok);
+        }
+
+        [Fact]
+        public void ValidPackage_Allowed()
+        {
+            var (ok, reason) = UpdatePolicy.ValidateUpdatePackage("1.3.0", "deadbeef");
+            Assert.True(ok);
+            Assert.Equal("更新包版本与哈希齐备，允许应用", reason);
+        }
+    }
+
+    // ── H3 方案A：自保护启动裁决（§4.8 #3）──
+    // 关键不变式：config 签名失败永远不拒绝启动（仅告警），否则会 brick 全部机器（断联）。
+    public class SelfProtectDecisionTests
+    {
+        [Fact]
+        public void ConfigFailure_NeverRejects_EvenWhenEnforced()
+        {
+            // 不变式核心：config 签名失败 + Enforce=true，仍必须允许启动
+            Assert.False(SelfProtectDecision.ShouldRejectStart(authenticodeOk: true, configSigOk: false, enforce: true));
+            Assert.False(SelfProtectDecision.ShouldRejectStart(authenticodeOk: true, configSigOk: false, enforce: false));
+        }
+
+        [Fact]
+        public void BinaryTamper_Enforced_Rejects()
+        {
+            Assert.True(SelfProtectDecision.ShouldRejectStart(authenticodeOk: false, configSigOk: true, enforce: true));
+        }
+
+        [Fact]
+        public void BinaryTamper_NotEnforced_Allows()
+        {
+            Assert.False(SelfProtectDecision.ShouldRejectStart(authenticodeOk: false, configSigOk: true, enforce: false));
+        }
+
+        [Fact]
+        public void AllGood_Allows()
+        {
+            Assert.False(SelfProtectDecision.ShouldRejectStart(authenticodeOk: true, configSigOk: true, enforce: true));
+        }
+
+        [Fact]
+        public void BinaryTamper_RejectsRegardlessOfConfig()
+        {
+            // config 是否完好不影响二进制篡改的拒绝裁决
+            Assert.True(SelfProtectDecision.ShouldRejectStart(authenticodeOk: false, configSigOk: false, enforce: true));
+        }
+    }
 }

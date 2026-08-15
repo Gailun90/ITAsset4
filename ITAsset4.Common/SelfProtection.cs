@@ -47,12 +47,24 @@ namespace ITAsset4.Common
         }
 
         /// <summary>
-        /// 是否强制自保护：校验失败即拒绝启动。
-        /// 生产环境（经代码签名 + 生成 config.sig 的发布流水线）必须置 true。
-        /// 本 workspace 本地编译产物为「未签名测试构建」，默认 false（软告警、不阻断启动），
-        /// 以便直接在 CNCDW202590 等测试机验证功能；正式发布时由签名 CI 注入 true。
+        /// 是否强制自保护：校验失败即拒绝启动（Program.cs 中据此 return 拒绝启动）。
+        ///
+        /// 安全默认（§4.8 #3）：
+        ///   - Release 构建（SDK 默认不定义 DEBUG）→ 默认 true，即"出厂即强制自保护"；
+        ///     此时目标机二进制必须具备有效 Authenticode 签名 + 随包 config.ini.sig，
+        ///     否则校验失败会拒绝启动（失败即闭环，符合预期）。
+        ///   - Debug / 本地未签名测试构建 → 默认 false（软告警、不阻断启动），
+        ///     以便直接在测试机验证功能，不被签名缺失卡住。
+        ///
+        /// CI 发布必须：① 对二进制做 Authenticode 签名；② 注入真实 ConfigSigningKey
+        /// 并生成 config.sig；③（可选）设置 ExpectedSignerThumbprint 指纹 pin。
+        /// 三者齐备后 Release 的 Enforce=true 才不会误伤正常启动。
         /// </summary>
+#if !DEBUG
+        public static bool Enforce { get; set; } = true;
+#else
         public static bool Enforce { get; set; } = false;
+#endif
 
         // ── 可选：期望的发布者证书指纹（Authenticode 签名者 thumbprint，小写 hex 无冒号）──
         /// <summary>期望的签名者证书指纹（空=不 pin，仅验证签名有效）。</summary>
