@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Threading;
 using System.Windows.Forms;
 using ITAsset4.Common;
 using Microsoft.Win32;
@@ -22,8 +23,28 @@ namespace ITAsset4.Tray
         private readonly PipeScreenServer _screenServer;
         private readonly PipeInputServer _inputServer;
 
+        /// <summary>
+        /// UI 线程的同步上下文，供后台管道线程安全地把 WinForms 调用 marshal 回 UI 线程。
+        /// 修复 K2：此前依赖 Application.OpenForms[0]（因无持久 Form 恒为 null），
+        /// 导致弹窗在管道工作线程上跨线程调用 ShowDialog。
+        /// </summary>
+        internal static SynchronizationContext UiSyncContext { get; private set; }
+
         public TrayApplicationContext()
         {
+            // 修复 K2：确保 UI 线程拥有有效的 SynchronizationContext，
+            // 供管道线程借助 Send/Post 把弹窗等 WinForms 操作调度回 UI 线程。
+            if (SynchronizationContext.Current == null)
+            {
+                var ctx = new System.Windows.Forms.WindowsFormsSynchronizationContext();
+                SynchronizationContext.SetSynchronizationContext(ctx);
+                UiSyncContext = ctx;
+            }
+            else
+            {
+                UiSyncContext = SynchronizationContext.Current;
+            }
+
             //  Start dedicated input worker BEFORE servers
             PipeServer.StartInputWorker();
 
@@ -75,19 +96,34 @@ namespace ITAsset4.Tray
             base.ExitThreadCore();
         }
 
+        /// <summary>
+        /// 在 UI 线程同步执行 action（阻塞调用方直到 UI 线程处理完毕）。
+        /// 用于模态弹窗等需要拿到返回值的场景。
+        /// </summary>
+        internal static void RunOnUiThread(Action action)
+        {
+            if (UiSyncContext != null) UiSyncContext.Send(_ => action(), null);
+            else action();
+        }
+
+        /// <summary>
+        /// 在 UI 线程异步执行 action（不阻塞调用方）。用于 Toast 等非模态提示。
+        /// </summary>
+        internal static void PostOnUiThread(Action action)
+        {
+            if (UiSyncContext != null) UiSyncContext.Post(_ => action(), null);
+            else action();
+        }
+
         public static void ShowBalloon(string title, string text)
         {
-            var form = Application.OpenForms.Count > 0 ? Application.OpenForms[0] : null;
             Action show = () =>
             {
                 var dlg = new ToastForm(title, text);
                 dlg.Show();
             };
-
-            if (form != null && form.InvokeRequired)
-                form.BeginInvoke(show);
-            else
-                show();
+            // 修复 K2：通过 UI 线程同步上下文调度，避免跨线程访问 WinForms。
+            PostOnUiThread(show);
         }
     }
 

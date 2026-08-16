@@ -187,8 +187,10 @@ namespace ITAsset4.Service
 
                 var sa = new SECURITY_ATTRIBUTES();
                 sa.nLength = Marshal.SizeOf(sa);
+                // 修复 K1：CreateProcessAsUser 需要至少 SecurityImpersonation 级别的主令牌，
+                // SecurityIdentification（最低级别）会导致 ERROR_BAD_IMPERSONATION_LEVEL 失败，Tray 无法启动。
                 if (!DuplicateTokenEx(hUserToken, MAXIMUM_ALLOWED, ref sa,
-                    SECURITY_IMPERSONATION_LEVEL.SecurityIdentification,
+                    SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation,
                     TOKEN_TYPE.TokenPrimary, out hDupToken))
                 {
                     int err = Marshal.GetLastWin32Error();
@@ -303,7 +305,7 @@ namespace ITAsset4.Service
         private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
         private const int WTSActive = 0;
 
-        private enum SECURITY_IMPERSONATION_LEVEL { SecurityIdentification = 1 }
+        private enum SECURITY_IMPERSONATION_LEVEL { SecurityIdentification = 1, SecurityImpersonation = 2, SecurityDelegation = 3 }
         private enum TOKEN_TYPE { TokenPrimary = 1 }
 
         [StructLayout(LayoutKind.Sequential)]
