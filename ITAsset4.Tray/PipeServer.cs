@@ -1,5 +1,7 @@
 using System;
 using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,6 +14,29 @@ using System.Runtime.InteropServices;
 
 namespace ITAsset4.Tray
 {
+    /// <summary>
+    /// 受限命名管道 ACL（修复 C2）。
+    /// 仅允许 LocalSystem 与内置 Administrators 连接；其余账户（含同会话普通用户进程）
+    /// 因 DACL 中无对应 Allow ACE 而隐式拒绝，无法连入截屏/注入输入管道。
+    /// 服务端 Service 以 SYSTEM 身份作为客户端连入下发命令，故不受影响。
+    /// </summary>
+    internal static class RestrictedPipeSecurity
+    {
+        internal static PipeSecurity Build()
+        {
+            var ps = new PipeSecurity();
+            // SYSTEM：完全控制（Service 以 SYSTEM 身份作为客户端连入下发命令）
+            ps.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+            // Administrators：完全控制（调试/运维需要）
+            ps.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+            return ps;
+        }
+    }
+
     public class PipeServer
     {
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
@@ -29,7 +54,15 @@ namespace ITAsset4.Tray
             {
                 try
                 {
-                    using (var server = new NamedPipeServerStream(PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Message, PipeOptions.Asynchronous))
+                    using (var server = new NamedPipeServerStream(
+                    PipeName,
+                    PipeDirection.InOut,
+                    1,
+                    PipeTransmissionMode.Message,
+                    PipeOptions.Asynchronous,
+                    inBufferSize: 65536,
+                    outBufferSize: 65536,
+                    pipeSecurity: RestrictedPipeSecurity.Build()))
                     {
                         await server.WaitForConnectionAsync(ct);
                         string json;
@@ -88,7 +121,6 @@ namespace ITAsset4.Tray
                 return tcs.Task;
             }
 
-            var form = Application.OpenForms.Count > 0 ? Application.OpenForms[0] : null;
             Action uiAction = () =>
             {
                 string result = req.type switch
@@ -100,7 +132,9 @@ namespace ITAsset4.Tray
                 };
                 tcs.TrySetResult(new PipeResponse { result = result });
             };
-            if (form != null && form.InvokeRequired) form.BeginInvoke(uiAction); else uiAction();
+            // 修复 K2：通过 UI 线程同步上下文把弹窗 marshal 回 UI 线程，
+            // 避免在工作线程上跨线程调用 WinForms（原 Application.OpenForms[0] 恒为 null）。
+            TrayApplicationContext.RunOnUiThread(uiAction);
             return tcs.Task;
         }
 
@@ -637,7 +671,10 @@ namespace ITAsset4.Tray
                 {
                     server = new NamedPipeServerStream(
                         InputPipeName, PipeDirection.In, 4,
-                        PipeTransmissionMode.Message, PipeOptions.Asynchronous);
+                        PipeTransmissionMode.Message, PipeOptions.Asynchronous,
+                        inBufferSize: 65536,
+                        outBufferSize: 65536,
+                        pipeSecurity: RestrictedPipeSecurity.Build());
                     await server.WaitForConnectionAsync(ct);
 
                     lock (_statusLock)

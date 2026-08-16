@@ -4,6 +4,8 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -58,7 +60,10 @@ namespace ITAsset4.Tray
                         PipeDirection.InOut,
                         1,
                         PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous);
+                        PipeOptions.Asynchronous,
+                        inBufferSize: 65536,
+                        outBufferSize: 65536,
+                        pipeSecurity: RestrictedPipeSecurity.Build());
                     await _pipe.WaitForConnectionAsync(ct);
                     Logger.Info("[PipeScreen] Service 已连接");
                     await ServeClientAsync(_pipe, ct);
@@ -198,8 +203,6 @@ namespace ITAsset4.Tray
         private static Task<PipeResponse> ProcessUiRequestAsync(PipeRequest req)
         {
             var tcs = new TaskCompletionSource<PipeResponse>();
-            var form = Application.OpenForms.Count > 0 ? Application.OpenForms[0] : null;
-
             Action uiAction = () =>
             {
                 string result = req.type switch
@@ -211,12 +214,9 @@ namespace ITAsset4.Tray
                 };
                 tcs.TrySetResult(new PipeResponse { result = result });
             };
-
-            if (form != null && form.InvokeRequired)
-                form.BeginInvoke(uiAction);
-            else
-                uiAction();
-
+            // 修复 K2：通过 UI 线程同步上下文把弹窗 marshal 回 UI 线程，
+            // 避免在工作线程上跨线程调用 WinForms（原 Application.OpenForms[0] 恒为 null）。
+            TrayApplicationContext.RunOnUiThread(uiAction);
             return tcs.Task;
         }
     }

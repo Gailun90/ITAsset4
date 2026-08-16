@@ -53,7 +53,9 @@ namespace ITAsset4.Common
             {
                 try
                 {
-                    var cert = new X509Certificate2(certPath, "", X509KeyStorageFlags.PersistKeySet);
+                    // 修复 K4：EphemeralKeySet 私钥仅驻留进程内存，不写磁盘，
+                    // 进程退出即消失，彻底消除 PersistKeySet 导致的私钥落盘泄漏风险。
+                    var cert = new X509Certificate2(certPath, "", X509KeyStorageFlags.EphemeralKeySet);
                     handler.ClientCertificates.Add(cert);
                     Logger.Info($"mTLS：已加载客户端证书 {certPath} (Subject={cert.Subject})");
                 }
