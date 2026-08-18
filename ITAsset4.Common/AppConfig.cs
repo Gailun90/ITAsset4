@@ -120,6 +120,14 @@ url = http://your-server:8000
 ; 初始注册 Token，需与服务端 AGENT_INITIAL_TOKEN 一致（可选，不填则使用内置默认值）
 ; initial_token = your-token-here
 
+[self_protection]
+; 是否强制自保护（二进制 Authenticode 校验失败即拒绝启动）。
+;   true  = 强制（Release 默认；需有效 Authenticode 签名，否则拒绝启动）
+;   false = 仅告警不阻断（适合测试机启动未签名构建）
+; 缺省（不写本行）= 回退编译期默认（Release=true / Debug=false）。
+; 生产环境应保持默认或显式 true，确保二进制完整性。
+; enforce = false
+
 [schedule]
 report_time    = 08:00
 poll_time      = 09:00

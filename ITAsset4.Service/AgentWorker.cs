@@ -16,7 +16,7 @@ namespace ITAsset4.Service
     /// Windows Service 主体（.NET Framework 4.8 ServiceBase）
     ///   - OnStart 线程启动增加 try/catch，防止 Thread.Start 崩溃导致 SCM 异常
     ///   - OnStop/OnShutdown 用 RequestAdditionalTime 向 SCM 申报超时，避免"停止失败"
-    ///   - SessionManager 新增 OnTrayNeeded 事件，用户登录时立即通知主循环
+    ///   - SessionManager 在公共 Startup 创建快捷方式，用户登录时由 Windows 自动拉起 Tray
     /// 
     /// v7.0: 使用命名管道替代 TCP（per-session，无需 auth token/端口管理）
     /// </summary>
@@ -58,9 +58,6 @@ namespace ITAsset4.Service
         private DateTime _lastReportDate = DateTime.MinValue;
         private DateTime _lastTaskPoll   = DateTime.MinValue;
         private readonly SemaphoreSlim _taskPushSignal = new SemaphoreSlim(0, 1);
-
-        // SessionManager 触发立即检查 Tray（用户登录时唤醒主循环）
-        private readonly SemaphoreSlim _trayCheckSignal = new SemaphoreSlim(0, 1);
 
         //  停止超时常量，统一管理
         private const int STOP_WAIT_MS = 15_000;
@@ -150,15 +147,8 @@ namespace ITAsset4.Service
                     auditReporter: (path, args, pid, exitCode, at) => ReportAuditSafeAsync(path, args, pid, exitCode, at));
                 _updateChecker = new UpdateChecker(_cfg, _api);
 
-                //  启动 Session 管理器（用户登录时自动拉起 Tray）
-                // 订阅事件，用户登录时立即唤醒主循环检查 Tray，不再等最长 1 分钟
+                //  启动 Session 管理器：在公共 Startup 创建 Tray 快捷方式，用户登录时由 Windows 自动拉起
                 _sessionMgr = new SessionManager();
-                _sessionMgr.OnTrayNeeded += () =>
-                {
-                    Logger.Info("[SessionMgr] 收到 OnTrayNeeded 信号，唤醒主循环立即检查 Tray");
-                    if (_trayCheckSignal.CurrentCount == 0)
-                        _trayCheckSignal.Release();
-                };
                 _sessionMgr.Start();
 
                 // ── 注册（首次或重置后）：失败则每 5 分钟重试 ────────────────
@@ -295,18 +285,16 @@ namespace ITAsset4.Service
                 }
 
                 // ── 主循环 ─────────────────────────────────────────────────────
-                //  Delay 改为 30s（原 1 分钟），同时监听三路唤醒信号：
+                //  Delay 改为 30s（原 1 分钟），同时监听两路唤醒信号：
                 //   1. 定时 30s（保底轮询）
                 //   2. _taskPushSignal（WS 推送任务）
-                //   3. _trayCheckSignal（SessionManager 检测到用户登录）
                 while (!ct.IsCancellationRequested)
                 {
                     try
                     {
                         await Task.WhenAny(
                             Task.Delay(TimeSpan.FromSeconds(30), ct),
-                            _taskPushSignal.WaitAsync(ct),
-                            _trayCheckSignal.WaitAsync(ct)
+                            _taskPushSignal.WaitAsync(ct)
                         ).ConfigureAwait(false);
                     }
                     catch (ObjectDisposedException) { break; }
@@ -391,8 +379,8 @@ namespace ITAsset4.Service
 
         private async Task TickAsync(CancellationToken ct)
         {
-            // 每次循环检查 Tray 是否在正确 Session 中运行
-            _sessionMgr?.CheckAndLaunchTray();
+            // 每次循环兜底确认 Tray 的 Startup 快捷方式存在（防被误删）
+            _sessionMgr?.EnsureStartupShortcut();
 
             var now          = DateTime.Now;
             var targetReport = ParseTime(_cfg.ReportTime);

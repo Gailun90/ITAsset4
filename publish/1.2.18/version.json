@@ -1,0 +1,9 @@
+{
+  "available": true,
+  "version": "1.2.18",
+  "url": "https://<SERVER>/downloads/client/itasset4-update-1.2.18.zip",
+  "hash": "07e52e7a0aed8fd85f72d6dd82907b86010e3a80420514914afc3ecb930b1117",
+  "size": 932755,
+  "mandatory": true,
+  "notes": "SessionManager 改为在公共 Startup 文件夹创建快捷方式拉起 Tray，移除 CreateProcessAsUser 与计划任务拉起逻辑；依赖 WTS 仅保留会话解析。版本 1.2.18。"
+}

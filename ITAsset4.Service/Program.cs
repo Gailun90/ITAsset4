@@ -119,6 +119,18 @@ namespace ITAsset4.Service
                     StartupTrace("default config written");
                 }
                 var cfg = AppConfig.Load(cfgPath);
+
+                // ── 自保护强制开关：允许 config.ini 覆盖（运维排障 / 测试机启动未签名构建）──
+                //    仅当 [self_protection] enforce 显式给出时才覆盖；缺省回退编译期默认
+                //    （Release 默认 true=强制，Debug 默认 false=仅告警）。
+                //    生产已签名构建不受影响；此覆盖仅作为本地/单机排障的逃生舱口。
+                string spEnforceRaw = cfg.Get("self_protection", "enforce", "").Trim();
+                if (spEnforceRaw.Length > 0 && bool.TryParse(spEnforceRaw, out bool spEnforceVal))
+                {
+                    SelfProtection.Enforce = spEnforceVal;
+                    Logger.Info($"[自保护] Enforce 已被 config.ini 覆盖为 {spEnforceVal}");
+                }
+
                 StartupTrace($"AppConfig loaded (ServerUrl={cfg.ServerUrl})");
 
                 // ── 自保护（最终形态·一）：校验 Agent 二进制签名 + 配置签名 ──
